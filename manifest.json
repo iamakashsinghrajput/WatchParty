@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "WatchParty — Watch Together",
-  "version": "2.1.1",
-  "description": "Watch Netflix, YouTube, Prime Video, or work side by side with a friend: camera-to-camera video and chat in a right-side panel.",
+  "version": "2.1.2",
+  "description": "Watch together from anywhere: camera and chat beside the video, rooms for up to six friends, reactions and playback sync.",
   "permissions": ["storage", "activeTab", "scripting"],
   "action": {
     "default_title": "Toggle WatchParty sidebar",
