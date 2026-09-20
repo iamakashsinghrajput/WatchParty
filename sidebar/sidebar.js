@@ -394,10 +394,12 @@ function acceptCall(call) {
   registerCall(call);
 }
 
-function registerConn(conn) {
+function registerConn(conn, outgoing) {
   const e = entry(conn.peer);
   e.conn = conn;
-  if (conn.metadata?.name) setPeerProfile(e, conn.metadata);
+  // metadata on an incoming connection describes the remote peer; on an
+  // outgoing one it's our own profile (meant for them) — don't read it back.
+  if (!outgoing && conn.metadata?.name) setPeerProfile(e, conn.metadata);
   conn.on("open", () => {
     conn.send(profileMsg("hello"));
     // The host introduces the newcomer to everyone already in the room; the
@@ -417,10 +419,10 @@ function registerConn(conn) {
   conn.on("error", () => {});
 }
 
-function registerCall(call) {
+function registerCall(call, outgoing) {
   const e = entry(call.peer);
   e.call = call;
-  if (call.metadata?.name) setPeerProfile(e, call.metadata);
+  if (!outgoing && call.metadata?.name) setPeerProfile(e, call.metadata);
   call.on("stream", (remote) => {
     addTile(e);
     e.video.srcObject = remote;
@@ -433,8 +435,8 @@ function dialPeer(pid) {
   if (!state.peer || pid === state.peer.id) return;
   if (state.peers.get(pid)?.conn) return;
   const meta = { name: profile.name, color: profile.color, avatar: profile.avatar, badge: profile.badge };
-  registerConn(state.peer.connect(pid, { metadata: meta }));
-  registerCall(state.peer.call(pid, state.stream, { metadata: meta }));
+  registerConn(state.peer.connect(pid, { metadata: meta }), true);
+  registerCall(state.peer.call(pid, state.stream, { metadata: meta }), true);
 }
 
 function handleData(e, msg) {
