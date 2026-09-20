@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Long Night — StreamFlix</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #0a0a0f; color: #eee; font: 14px/1.5 system-ui, sans-serif; min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 24px; padding: 14px 28px; background: #101018; }
+  .brand { color: #e50914; font-weight: 800; font-size: 20px; letter-spacing: 1px; }
+  nav a { color: #bbb; text-decoration: none; margin-right: 18px; font-size: 13px; }
+  .stage { max-width: 1100px; margin: 24px auto; padding: 0 24px; }
+  video#film {
+    width: 100%; aspect-ratio: 16 / 9; border-radius: 10px; background: #000; display: block;
+  }
+  .meta { padding: 18px 4px; color: #999; max-width: 720px; }
+  .meta strong { color: #eee; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="brand">STREAMFLIX</span>
+    <nav><a href="#">Home</a><a href="#">Series</a><a href="#">Films</a><a href="#">My List</a></nav>
+  </header>
+  <div class="stage">
+    <video id="film" controls muted playsinline preload="auto"
+      src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"></video>
+    <script>
+      // Offline fallback: if the sample film can't load, play a generated stream
+      // so play/pause sync stays testable (seek needs a real file).
+      const film = document.getElementById("film");
+      film.addEventListener("error", () => {
+        const c = document.createElement("canvas");
+        c.width = 640; c.height = 360;
+        const x = c.getContext("2d");
+        let t = 0;
+        setInterval(() => {
+          t += 1;
+          x.fillStyle = `hsl(${t % 360} 40% 25%)`;
+          x.fillRect(0, 0, 640, 360);
+          x.fillStyle = "#fff";
+          x.font = "40px system-ui";
+          x.textAlign = "center";
+          x.fillText("DEMO FILM", 320, 190);
+        }, 100);
+        film.removeAttribute("src");
+        film.srcObject = c.captureStream(10);
+      });
+    </script>
+    <p class="meta"><strong>The Long Night</strong> · 2026 · Drama — Friends in different cities
+      press play at the same moment. A demo page standing in for Netflix/Prime while testing WatchParty.</p>
+  </div>
+</body>
+</html>

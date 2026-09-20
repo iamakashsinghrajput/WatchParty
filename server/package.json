@@ -1,0 +1,12 @@
+{
+  "name": "watchparty-signaling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted signaling server for the WatchParty extension (PeerServer).",
+  "scripts": {
+    "start": "peerjs --port 9000 --path /"
+  },
+  "dependencies": {
+    "peer": "^1.0.2"
+  }
+}

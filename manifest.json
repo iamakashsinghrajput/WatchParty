@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "WatchParty — Watch Together",
+  "version": "2.1.0",
+  "description": "Watch Netflix, YouTube, Prime Video, or work side by side with a friend: camera-to-camera video and chat in a right-side panel.",
+  "permissions": ["storage"],
+  "action": {
+    "default_title": "Toggle WatchParty sidebar",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sidebar/*", "lib/*", "icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "watchparty@akashsingh.dev",
+      "strict_min_version": "121.0"
+    }
+  }
+}
