@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "WatchParty — Watch Together",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Watch Netflix, YouTube, Prime Video, or work side by side with a friend: camera-to-camera video and chat in a right-side panel.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "activeTab", "scripting"],
   "action": {
     "default_title": "Toggle WatchParty sidebar",
     "default_icon": {
@@ -25,7 +25,22 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "https://*.netflix.com/*",
+        "https://*.youtube.com/*",
+        "https://youtu.be/*",
+        "https://*.primevideo.com/*",
+        "https://*.amazon.com/*",
+        "https://*.amazon.in/*",
+        "https://*.amazon.co.uk/*",
+        "https://*.amazon.de/*",
+        "https://*.amazon.co.jp/*",
+        "https://*.disneyplus.com/*",
+        "https://*.hotstar.com/*",
+        "https://*.hulu.com/*",
+        "https://*.max.com/*",
+        "https://*.crunchyroll.com/*"
+      ],
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle",
