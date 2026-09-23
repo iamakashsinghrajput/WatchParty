@@ -761,7 +761,16 @@ function enableChat(on) {
 
 function playSafe(v) {
   const p = v.play();
-  if (p?.catch) p.catch(() => { v.muted = true; v.play().catch(() => {}); });
+  if (p?.catch) p.catch(() => {
+    // Autoplay with sound was blocked — start muted so video shows, then
+    // restore sound on the user's next click anywhere in the panel.
+    v.muted = true;
+    v.play().catch(() => {});
+    document.addEventListener("click", () => {
+      v.muted = false;
+      v.play().catch(() => {});
+    }, { once: true });
+  });
 }
 
 function addTile(e) {
