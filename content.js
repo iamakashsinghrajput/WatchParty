@@ -31,6 +31,7 @@
 
   function ensureFrame() {
     if (frame && frame.isConnected) return frame;
+    injectBridge();
     frame = document.createElement("iframe");
     frame.id = "watchparty-frame";
     frame.src = api.runtime.getURL("sidebar/sidebar.html");
@@ -100,19 +101,38 @@
     return video;
   }
 
+  // Seek through the page-world bridge: on Netflix (and similar DRM players)
+  // setting video.currentTime is rejected, so the bridge calls the site's own
+  // player API; everywhere else it falls back to currentTime.
+  function seekTo(time) {
+    if (typeof time !== "number") return;
+    window.postMessage({ source: "watchparty-bridge", action: "seek", time }, "*");
+  }
+
   function applyControl(cmd, time) {
     const v = pickVideo();
     if (!v) return;
-    suppressUntil = Date.now() + 900;
+    // Wider window than the local-play case: the bridge round-trip plus a
+    // Netflix API seek can take a beat, and we must not echo it back.
+    suppressUntil = Date.now() + 1500;
     if (cmd === "play") {
-      if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) v.currentTime = time;
+      if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) seekTo(time);
       v.play().catch(() => {});
     } else if (cmd === "pause") {
       v.pause();
-      if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) v.currentTime = time;
+      if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) seekTo(time);
     } else if (cmd === "seek" && typeof time === "number") {
-      v.currentTime = time;
+      seekTo(time);
     }
+  }
+
+  // Inject the page-world bridge once, so seeks can reach site player APIs.
+  function injectBridge() {
+    if (document.getElementById("watchparty-bridge-script")) return;
+    const s = document.createElement("script");
+    s.id = "watchparty-bridge-script";
+    s.src = api.runtime.getURL("page-bridge.js");
+    (document.head || document.documentElement).appendChild(s);
   }
 
   // SPA sites swap their <video> without navigation — re-pick periodically.
