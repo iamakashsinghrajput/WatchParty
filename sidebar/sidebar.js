@@ -79,6 +79,10 @@ const state = {
   allowed: new Set(),   // host: peer ids allowed to control playback
   lastVideo: null,      // {paused, time, at} last known local page-video state
   pendingTick: null,    // host position report awaiting local comparison
+  hostState: null,      // guest: {paused, time, at} the host's authoritative state
+  pageHref: "",         // the URL of the page under the sidebar
+  lastSharedUrl: "",    // host: last video URL broadcast to the room
+  navigating: false,    // guest: currently opening the host's video
   view: "lobby",        // "lobby" | "room" | "profile"
   viewBefore: "lobby",
 };
@@ -412,6 +416,8 @@ function registerConn(conn, outgoing) {
         .filter((x) => x.id !== conn.peer && x.conn?.open)
         .map((x) => ({ id: x.id }));
       conn.send({ type: "roster", peers: others });
+      // Auto-open the host's current video on the newcomer's screen.
+      if (state.pageVideo && state.pageHref) conn.send({ type: "open-video", url: state.pageHref });
       // Land the newcomer at the host's current position and play state.
       const lv = latestVideoState();
       if (lv) conn.send({ type: "sync-state", time: lv.time, paused: lv.paused });
@@ -472,6 +478,9 @@ function handleData(e, msg) {
     case "sync-state":
     case "sync-tick":
       onHostTick(e, msg);
+      break;
+    case "open-video":
+      if (e.id === hostId()) onOpenVideo(String(msg.url || ""));
       break;
     case "ctrl":
       if (e.id === hostId()) {
@@ -556,10 +565,18 @@ async function createRoom() {
   if (state.peer || !requireName()) return;
   await ensureStream();
   state.role = "host";
-  startHost(makeCode(), 0);
+  startHost(makeCode(), 0, false);
 }
 
-function startHost(code, attempt) {
+// Re-create a room on the same code after the host navigated to a new video.
+async function rehostRoom(code) {
+  if (state.peer || !requireName()) return;
+  await ensureStream();
+  state.role = "host";
+  startHost(code, 0, true);
+}
+
+function startHost(code, attempt, keepCode) {
   setStatus("wait", "Creating room…");
   const p = newPeer(code);
   state.peer = p;
@@ -567,25 +584,33 @@ function startHost(code, attempt) {
     state.room = id;
     enterRoom();
     refreshStatus();
-    feedEvent(profile, "created the party 🎉");
+    if (!keepCode) feedEvent(profile, "created the party 🎉");
     addSystem(`Share the code ${id} — up to ${MAX_PARTICIPANTS} people can join.`);
   });
   p.on("error", (err) => {
-    if (err?.type === "unavailable-id" && attempt < 3) {
-      startHost(makeCode(), attempt + 1);
+    if (err?.type === "unavailable-id" && attempt < (keepCode ? 10 : 3)) {
+      try { p.destroy(); } catch {}
+      state.peer = null;
+      if (keepCode) {
+        // The signaling server still holds our old id for a few seconds after
+        // the navigation dropped it — wait and reclaim the SAME code.
+        setTimeout(() => startHost(code, attempt + 1, true), 1200);
+      } else {
+        startHost(makeCode(), attempt + 1, false);
+      }
       return;
     }
     handlePeerError(err);
   });
 }
 
-async function joinRoom(codeRaw) {
+async function joinRoom(codeRaw, rejoinAttempt) {
   if (state.peer || !requireName()) return;
   const code = String(codeRaw || "").trim().toLowerCase();
   if (!code) return;
   await ensureStream();
   state.role = "guest";
-  setStatus("wait", "Joining room…");
+  setStatus("wait", rejoinAttempt ? "Reconnecting…" : "Joining room…");
   const p = newPeer();
   state.peer = p;
   p.on("open", () => {
@@ -593,7 +618,17 @@ async function joinRoom(codeRaw) {
     enterRoom();
     dialPeer(code);
   });
-  p.on("error", handlePeerError);
+  p.on("error", (err) => {
+    // On a rejoin the host may still be re-registering after its own
+    // navigation — retry a few times before giving up.
+    if (err?.type === "peer-unavailable" && (rejoinAttempt || 0) < 8) {
+      try { p.destroy(); } catch {}
+      state.peer = null;
+      setTimeout(() => joinRoom(code, (rejoinAttempt || 0) + 1), 1500);
+      return;
+    }
+    handlePeerError(err);
+  });
 }
 
 function handlePeerError(err) {
@@ -615,6 +650,7 @@ function handlePeerError(err) {
 function leaveRoom() {
   broadcast({ type: "bye" });
   try { state.peer?.destroy(); } catch {}
+  if (FRAMED) parent.postMessage({ source: "watchparty", action: "clear-session" }, "*");
   setTimeout(() => location.reload(), 200);
 }
 
@@ -673,6 +709,22 @@ function latestVideoState() {
   };
 }
 
+// The host's expected current position, extrapolated from its last report.
+function hostExpectedTime() {
+  const hs = state.hostState;
+  if (!hs) return 0;
+  return hs.time + (hs.paused ? 0 : (Date.now() - hs.at) / 1000);
+}
+
+// Record the host's authoritative state on the guest side.
+function noteHostState(kind, time) {
+  const prev = state.hostState;
+  let paused = prev ? prev.paused : true;
+  if (kind === "play") paused = false;
+  else if (kind === "pause") paused = true;
+  state.hostState = { paused, time: Number(time) || 0, at: Date.now() };
+}
+
 // This user touched their own player (play/pause/seek).
 function onPageVideoEvent(d) {
   if (!state.room) return;
@@ -686,9 +738,14 @@ function onPageVideoEvent(d) {
     const host = state.peers.get(hostId());
     if (host?.conn?.open) host.conn.send({ type: "sync-req", kind: d.kind, time: d.time });
     feedSyncEvent(profile, d.kind, d.time);
-  } else if (now - lastNoCtrlNote > 8000) {
-    lastNoCtrlNote = now;
-    addSystem("Only the host controls playback — ask them to hand you the remote.");
+  } else {
+    // No remote: the guest cannot diverge — snap their player back to the
+    // host's current state so they can only watch what the host is watching.
+    if (state.hostState) applySyncLocal(state.hostState.paused ? "pause" : "play", hostExpectedTime());
+    if (now - lastNoCtrlNote > 8000) {
+      lastNoCtrlNote = now;
+      addSystem("Only the host controls playback — ask them to hand you the remote.");
+    }
   }
 }
 
@@ -697,6 +754,7 @@ function onRemoteSync(e, msg) {
   if (state.role !== "guest" || e.id !== hostId()) return;
   const kind = String(msg.kind || "");
   if (!["play", "pause", "seek"].includes(kind)) return;
+  noteHostState(kind, msg.time);
   if (msg.by === profile.name) return; // our own action, echoed back by the host
   const src =
     [...state.peers.values()].find((p) => p.profile.name === msg.by)?.profile || e.profile;
@@ -717,8 +775,41 @@ function onSyncRequest(e, msg) {
 // Position report from the host (on join, then every ~10s) — correct drift.
 function onHostTick(e, msg) {
   if (state.role !== "guest" || e.id !== hostId()) return;
+  state.hostState = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
   state.pendingTick = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
   queryPageVideo();
+}
+
+/* ------------------------------ content sync ------------------------------- */
+// The host shares which video it's watching; invited members auto-open it.
+
+function sameVideo(a, b) {
+  try {
+    const ua = new URL(a), ub = new URL(b);
+    return ua.origin === ub.origin && ua.pathname === ub.pathname;
+  } catch {
+    return a === b;
+  }
+}
+
+// The host is on a watch page — share its URL with the room (once per change).
+function shareHostVideo() {
+  if (state.role !== "host" || !state.pageVideo || !state.pageHref) return;
+  if (state.pageHref === state.lastSharedUrl) return;
+  state.lastSharedUrl = state.pageHref;
+  broadcast({ type: "open-video", url: state.pageHref });
+}
+
+// A guest is told which video the host is watching — open it if different.
+function onOpenVideo(url) {
+  if (!FRAMED || state.role !== "guest" || !url) return;
+  if (state.navigating) return;
+  if (state.pageHref && sameVideo(url, state.pageHref)) return;
+  state.navigating = true;
+  addSystem("Opening the host's video…");
+  // Session is already persisted (see enterRoom); the content script stores it
+  // and navigates, then the sidebar reloads and auto-rejoins this same room.
+  parent.postMessage({ source: "watchparty", action: "navigate", url }, "*");
 }
 
 function toggleGrant(e) {
@@ -832,6 +923,14 @@ function enterRoom() {
   attachLocal();
   layoutGrid();
   queryPageVideo();
+  // Persist the room in the page so it survives the guest navigating to the
+  // host's video (the content script re-opens the sidebar with ?rejoin).
+  if (FRAMED && state.room) {
+    parent.postMessage(
+      { source: "watchparty", action: "session", code: state.room, role: state.role },
+      "*"
+    );
+  }
 }
 
 function enableChat(on) {
@@ -1172,10 +1271,12 @@ function wire() {
       onPageVideoEvent(d);
     } else if (d.action === "video-state") {
       state.pageVideo = !!d.available;
+      if (typeof d.href === "string") state.pageHref = d.href;
       if (state.pageVideo) {
         state.lastVideo = { paused: !!d.paused, time: Number(d.time) || 0, at: Date.now() };
       }
       updateLobbyButtons();
+      shareHostVideo(); // host: broadcast this watch URL to the room
       // A guest compares the host's reported position against its own player.
       if (state.pendingTick && Date.now() - state.pendingTick.at < 3000 && state.pageVideo) {
         const t = state.pendingTick;
@@ -1216,8 +1317,14 @@ async function init() {
     }
   }, 10000);
 
+  // Auto-rejoin after the page navigated to the host's video (content script
+  // re-opened the sidebar with ?rejoin once it saw a stored session).
+  const rejoin = params.get("rejoin");
   const join = params.get("join");
-  if (params.get("create") === "1" && profile.name) {
+  if (rejoin && profile.name) {
+    if (params.get("role") === "host") rehostRoom(rejoin);
+    else joinRoom(rejoin, 1);
+  } else if (params.get("create") === "1" && profile.name) {
     createRoom();
   } else if (join) {
     $("joinInput").value = join;

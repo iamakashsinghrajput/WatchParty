@@ -29,12 +29,26 @@
   btn.setAttribute("aria-label", "Toggle WatchParty sidebar");
   btn.addEventListener("click", () => setOpen(!isOpen));
 
+  function storedSession() {
+    try {
+      return JSON.parse(sessionStorage.getItem("watchparty-session") || "null");
+    } catch {
+      return null;
+    }
+  }
+
   function ensureFrame() {
     if (frame && frame.isConnected) return frame;
     injectBridge();
     frame = document.createElement("iframe");
     frame.id = "watchparty-frame";
-    frame.src = api.runtime.getURL("sidebar/sidebar.html");
+    let src = api.runtime.getURL("sidebar/sidebar.html");
+    // After navigating to the host's video, rejoin the same room automatically.
+    const sess = storedSession();
+    if (sess && sess.code) {
+      src += `?rejoin=${encodeURIComponent(sess.code)}&role=${sess.role === "host" ? "host" : "guest"}`;
+    }
+    frame.src = src;
     // Camera/mic permission is scoped to the extension origin, so one grant
     // covers every site the sidebar is opened on.
     frame.setAttribute("allow", "camera; microphone; autoplay; clipboard-write");
@@ -161,9 +175,27 @@
         available: !!v,
         paused: v ? v.paused : true,
         time: v ? v.currentTime : 0,
+        href: location.href,
       });
     } else if (d.action === "video-control") {
       applyControl(String(d.cmd || ""), d.time);
+    } else if (d.action === "session") {
+      // The sidebar joined/created a room — remember it so we can rejoin after
+      // navigating to the host's video (survives same-site navigation).
+      try {
+        sessionStorage.setItem(
+          "watchparty-session",
+          JSON.stringify({ code: String(d.code || ""), role: d.role === "host" ? "host" : "guest" })
+        );
+      } catch {}
+    } else if (d.action === "clear-session") {
+      try { sessionStorage.removeItem("watchparty-session"); } catch {}
+    } else if (d.action === "navigate") {
+      const url = String(d.url || "");
+      if (url && url !== location.href) {
+        try { sessionStorage.setItem("watchparty-open", "1"); } catch {}
+        location.assign(url); // rejoin happens after the reload (see ensureFrame)
+      }
     }
   });
 
@@ -172,10 +204,12 @@
     saved = sessionStorage.getItem("watchparty-open");
   } catch {}
   const autoOpen = AUTO_OPEN_HOSTS.test(location.hostname) || isAmazonVideo;
+  const hasSession = !!storedSession();
 
   const start = () => {
     (document.body || document.documentElement).appendChild(btn);
-    if (saved === "1" || (autoOpen && saved !== "0")) setOpen(true);
+    // A stored session means we navigated to the host's video and must rejoin.
+    if (hasSession || saved === "1" || (autoOpen && saved !== "0")) setOpen(true);
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", start);
