@@ -74,8 +74,11 @@ const state = {
   micOn: false,
   role: null,           // "host" | "guest"
   room: null,
-  syncOn: false,
-  pageVideo: false,
+  pageVideo: false,     // the page under the sidebar has a <video> to sync
+  canControl: false,    // guest: the host handed us the remote
+  allowed: new Set(),   // host: peer ids allowed to control playback
+  lastVideo: null,      // {paused, time, at} last known local page-video state
+  pendingTick: null,    // host position report awaiting local comparison
   view: "lobby",        // "lobby" | "room" | "profile"
   viewBefore: "lobby",
 };
@@ -409,6 +412,9 @@ function registerConn(conn, outgoing) {
         .filter((x) => x.id !== conn.peer && x.conn?.open)
         .map((x) => ({ id: x.id }));
       conn.send({ type: "roster", peers: others });
+      // Land the newcomer at the host's current position and play state.
+      const lv = latestVideoState();
+      if (lv) conn.send({ type: "sync-state", time: lv.time, paused: lv.paused });
     }
     announce(e);
     refreshStatus();
@@ -459,6 +465,23 @@ function handleData(e, msg) {
       break;
     case "sync":
       onRemoteSync(e, msg);
+      break;
+    case "sync-req":
+      onSyncRequest(e, msg);
+      break;
+    case "sync-state":
+    case "sync-tick":
+      onHostTick(e, msg);
+      break;
+    case "ctrl":
+      if (e.id === hostId()) {
+        state.canControl = !!msg.allowed;
+        addSystem(
+          state.canControl
+            ? `${e.profile.name} gave you the remote — you can control playback now`
+            : `${e.profile.name} took back playback control`
+        );
+      }
       break;
     case "full":
       setStatus("err", "Room is full");
@@ -596,9 +619,13 @@ function leaveRoom() {
 }
 
 /* ------------------------------ playback sync ------------------------------ */
+// Host-authoritative, always on: the room creator's player is the source of
+// truth. Guests follow automatically (play/pause/seek and position). Only the
+// host controls playback, unless the host hands a guest the remote.
 
 let lastSyncSent = 0;
 let lastSeekFeed = 0;
+let lastNoCtrlNote = 0;
 
 const fmtTime = (t) => {
   t = Math.max(0, Math.round(Number(t) || 0));
@@ -609,52 +636,106 @@ const fmtTime = (t) => {
 };
 
 const syncEventText = (kind, time) =>
-  kind === "play" ? "started playing the video"
+  kind === "play" ? `started playing the video at ${fmtTime(time)}`
   : kind === "pause" ? "paused the video"
   : `jumped to ${fmtTime(time)}`;
 
-function toggleSync() {
-  state.syncOn = !state.syncOn;
-  $("syncBtn").classList.toggle("active", state.syncOn);
-  if (state.syncOn) {
-    queryPageVideo();
-    addSystem("Playback sync on — play, pause and seek follow everyone who has sync on.");
-  } else {
-    addSystem("Playback sync off.");
-  }
-}
+const hostId = () => (state.role === "guest" ? state.room : null);
 
 function queryPageVideo() {
   if (FRAMED) parent.postMessage({ source: "watchparty", action: "video-query" }, "*");
 }
 
-// The page's video did something (this user pressed play/pause/seek) — tell the room.
+function applySyncLocal(kind, time) {
+  if (!FRAMED) return;
+  parent.postMessage(
+    { source: "watchparty", action: "video-control", cmd: kind, time: Number(time) || 0 },
+    "*"
+  );
+}
+
+function feedSyncEvent(p, kind, time) {
+  const now = Date.now();
+  if (kind === "seek") {
+    if (now - lastSeekFeed < 2000) return;
+    lastSeekFeed = now;
+  }
+  feedEvent(p, syncEventText(kind, time));
+}
+
+// The host's current player position, extrapolated from the last poll.
+function latestVideoState() {
+  const lv = state.lastVideo;
+  if (!lv) return null;
+  return {
+    paused: lv.paused,
+    time: lv.time + (lv.paused ? 0 : (Date.now() - lv.at) / 1000),
+  };
+}
+
+// This user touched their own player (play/pause/seek).
 function onPageVideoEvent(d) {
-  if (!state.syncOn) return;
+  if (!state.room) return;
   const now = Date.now();
   if (now - lastSyncSent < 250) return;
   lastSyncSent = now;
-  broadcast({ type: "sync", kind: d.kind, time: d.time });
-  if (d.kind !== "seek" || now - lastSeekFeed > 2000) {
-    if (d.kind === "seek") lastSeekFeed = now;
-    feedEvent(profile, syncEventText(d.kind, d.time));
+  if (state.role === "host") {
+    broadcast({ type: "sync", kind: d.kind, time: d.time, by: profile.name });
+    feedSyncEvent(profile, d.kind, d.time);
+  } else if (state.canControl) {
+    const host = state.peers.get(hostId());
+    if (host?.conn?.open) host.conn.send({ type: "sync-req", kind: d.kind, time: d.time });
+    feedSyncEvent(profile, d.kind, d.time);
+  } else if (now - lastNoCtrlNote > 8000) {
+    lastNoCtrlNote = now;
+    addSystem("Only the host controls playback — ask them to hand you the remote.");
   }
 }
 
-// A peer's video did something — show it in the feed, and apply it to our
-// page's video if sync is on.
+// A sync command arrived. Guests obey the host and no one else.
 function onRemoteSync(e, msg) {
+  if (state.role !== "guest" || e.id !== hostId()) return;
   const kind = String(msg.kind || "");
   if (!["play", "pause", "seek"].includes(kind)) return;
-  const now = Date.now();
-  if (kind !== "seek" || now - lastSeekFeed > 2000) {
-    if (kind === "seek") lastSeekFeed = now;
-    feedEvent(e.profile, syncEventText(kind, msg.time));
+  if (msg.by === profile.name) return; // our own action, echoed back by the host
+  const src =
+    [...state.peers.values()].find((p) => p.profile.name === msg.by)?.profile || e.profile;
+  feedSyncEvent(src, kind, msg.time);
+  applySyncLocal(kind, msg.time);
+}
+
+// An authorized guest asked the host to change playback.
+function onSyncRequest(e, msg) {
+  if (state.role !== "host" || !state.allowed.has(e.id)) return;
+  const kind = String(msg.kind || "");
+  if (!["play", "pause", "seek"].includes(kind)) return;
+  applySyncLocal(kind, msg.time);
+  broadcast({ type: "sync", kind, time: msg.time, by: e.profile.name });
+  feedSyncEvent(e.profile, kind, msg.time);
+}
+
+// Position report from the host (on join, then every ~10s) — correct drift.
+function onHostTick(e, msg) {
+  if (state.role !== "guest" || e.id !== hostId()) return;
+  state.pendingTick = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
+  queryPageVideo();
+}
+
+function toggleGrant(e) {
+  const allowed = !state.allowed.has(e.id);
+  if (allowed) state.allowed.add(e.id);
+  else state.allowed.delete(e.id);
+  e.grantBtn?.classList.toggle("on", allowed);
+  if (e.grantBtn) {
+    e.grantBtn.title = allowed
+      ? `${e.profile.name} has the remote — click to take it back`
+      : `Hand ${e.profile.name} the remote (play/pause/seek)`;
   }
-  if (!state.syncOn || !FRAMED) return;
-  parent.postMessage(
-    { source: "watchparty", action: "video-control", cmd: kind, time: Number(msg.time) || 0 },
-    "*"
+  if (e.conn?.open) e.conn.send({ type: "ctrl", allowed });
+  addSystem(
+    allowed
+      ? `${e.profile.name} can now control playback`
+      : `${e.profile.name} can no longer control playback`
   );
 }
 
@@ -784,6 +865,18 @@ function addTile(e) {
   tag.className = "tag";
   tag.textContent = e.profile.name;
   tile.append(vid, tag);
+  // The host can hand this person the remote from their tile.
+  if (state.role === "host") {
+    const grant = document.createElement("button");
+    grant.className = "grant";
+    grant.type = "button";
+    grant.title = `Hand ${e.profile.name} the remote (play/pause/seek)`;
+    grant.innerHTML =
+      '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="3"/><circle cx="12" cy="7" r="1"/><line x1="10" y1="12" x2="14" y2="12"/><line x1="10" y1="16" x2="14" y2="16"/></svg>';
+    grant.addEventListener("click", () => toggleGrant(e));
+    tile.appendChild(grant);
+    e.grantBtn = grant;
+  }
   $("remoteGrid").appendChild(tile);
   e.tile = tile;
   e.video = vid;
@@ -959,9 +1052,16 @@ function updateControls() {
 }
 
 function updateLobbyButtons() {
-  const ok = !!$("nameInput").value.trim();
-  $("createBtn").disabled = !ok;
-  $("joinBtn").disabled = !ok;
+  const hasName = !!$("nameInput").value.trim();
+  // Inside a page, a party needs a video to sync — ask for one first.
+  const hasVideo = !FRAMED || state.pageVideo;
+  $("createBtn").disabled = !(hasName && hasVideo);
+  $("joinBtn").disabled = !(hasName && hasVideo);
+  if (state.view === "lobby" && FRAMED) {
+    const gateMsg = "First select a video — open something to watch on this page, then create or join a room.";
+    if (!hasVideo) setNote(gateMsg);
+    else if ($("note").textContent === gateMsg) setNote("");
+  }
 }
 
 function flash(el, text) {
@@ -1013,7 +1113,6 @@ function wire() {
 
   $("camBtn").addEventListener("click", toggleCam);
   $("micBtn").addEventListener("click", toggleMic);
-  $("syncBtn").addEventListener("click", toggleSync);
   $("leaveBtn").addEventListener("click", leaveRoom);
   $("popoutBtn").addEventListener("click", popOut);
 
@@ -1059,7 +1158,6 @@ function wire() {
   });
   if (!FRAMED) {
     $("closeBtn").style.display = "none";
-    $("syncBtn").style.display = "none";
   }
 
   buildProfileControls();
@@ -1074,11 +1172,18 @@ function wire() {
       onPageVideoEvent(d);
     } else if (d.action === "video-state") {
       state.pageVideo = !!d.available;
-      $("syncBtn").disabled = !state.pageVideo;
-      $("syncBtn").title = state.pageVideo
-        ? "Sync playback with the room"
-        : "No video found on this page";
-      if (!state.pageVideo && state.syncOn) toggleSync();
+      if (state.pageVideo) {
+        state.lastVideo = { paused: !!d.paused, time: Number(d.time) || 0, at: Date.now() };
+      }
+      updateLobbyButtons();
+      // A guest compares the host's reported position against its own player.
+      if (state.pendingTick && Date.now() - state.pendingTick.at < 3000 && state.pageVideo) {
+        const t = state.pendingTick;
+        state.pendingTick = null;
+        const target = t.time + (t.paused ? 0 : (Date.now() - t.at) / 1000);
+        if (Math.abs((Number(d.time) || 0) - target) > 2) applySyncLocal("seek", target);
+        if (!!d.paused !== t.paused) applySyncLocal(t.paused ? "pause" : "play", target);
+      }
     }
   });
 
@@ -1100,6 +1205,16 @@ async function init() {
   // the sidebar opens on Netflix/YouTube/Prime/anywhere.
   await ensureStream();
   queryPageVideo();
+
+  // Keep watching the page's video: gates the lobby until one is selected,
+  // and keeps the host's known position fresh for join-state and drift ticks.
+  if (FRAMED) setInterval(queryPageVideo, 4000);
+  setInterval(() => {
+    if (state.role === "host" && state.room && FRAMED) {
+      const lv = latestVideoState();
+      if (lv) broadcast({ type: "sync-tick", time: lv.time, paused: lv.paused });
+    }
+  }, 10000);
 
   const join = params.get("join");
   if (params.get("create") === "1" && profile.name) {

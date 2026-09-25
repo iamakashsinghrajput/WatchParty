@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>StreamFlix — Browse</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { background: #0a0a0f; color: #eee; font: 14px/1.6 system-ui, sans-serif; min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 24px; padding: 14px 28px; background: #101018; }
+  .brand { color: #e50914; font-weight: 800; font-size: 20px; letter-spacing: 1px; }
+  nav a { color: #bbb; text-decoration: none; margin-right: 18px; font-size: 13px; }
+  main { max-width: 900px; margin: 40px auto; padding: 0 24px; }
+  h1 { font-weight: 400; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 24px; }
+  .card { aspect-ratio: 2/3; border-radius: 8px; background: linear-gradient(160deg, #1b2038, #141420); }
+</style>
+</head>
+<body>
+  <header>
+    <span class="brand">STREAMFLIX</span>
+    <nav><a href="#">Home</a><a href="#">Series</a><a href="#">Films</a><a href="#">My List</a></nav>
+  </header>
+  <main>
+    <h1>Browse</h1>
+    <p>A browse page with no video playing — used to test that WatchParty asks you to select a video first.</p>
+    <div class="grid"><div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div></div>
+  </main>
+</body>
+</html>
