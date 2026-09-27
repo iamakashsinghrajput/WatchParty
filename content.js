@@ -1,6 +1,11 @@
-// WatchParty content script: injects the sidebar iframe and a toggle handle,
-// shifts the page over so the sidebar takes a real right-side column, and
-// bridges the page's <video> element to the sidebar for playback sync.
+// WatchParty content script (top frame only): injects the sidebar iframe and a
+// toggle handle, shifts the page over, and coordinates playback sync.
+//
+// Video detection/control lives in frame-agent.js, which runs in EVERY frame
+// (including cross-origin embeds used by many video sites). This top-frame
+// script relays state/events up from the agents to the sidebar, and control
+// commands down to the agents. Netflix-style seeks also go through the
+// page-world bridge (page-bridge.js).
 (() => {
   if (window.top !== window) return;
   if (window.__watchpartyLoaded) return;
@@ -29,12 +34,21 @@
   btn.setAttribute("aria-label", "Toggle WatchParty sidebar");
   btn.addEventListener("click", () => setOpen(!isOpen));
 
-  function storedSession() {
+  /* --------------------------- one-shot rejoin --------------------------- */
+  // Set ONLY when auto-opening the host's video (content sync), and consumed
+  // on the very next page load. This is a one-shot handoff, never a sticky
+  // session — creating or leaving a room is never affected by it.
+  const REJOIN_TTL = 60000;
+
+  function readRejoin() {
     try {
-      return JSON.parse(sessionStorage.getItem("watchparty-session") || "null");
-    } catch {
-      return null;
-    }
+      const r = JSON.parse(sessionStorage.getItem("watchparty-rejoin") || "null");
+      if (r && r.code && Date.now() - (r.at || 0) < REJOIN_TTL) return r;
+    } catch {}
+    return null;
+  }
+  function clearRejoin() {
+    try { sessionStorage.removeItem("watchparty-rejoin"); } catch {}
   }
 
   function ensureFrame() {
@@ -43,10 +57,10 @@
     frame = document.createElement("iframe");
     frame.id = "watchparty-frame";
     let src = api.runtime.getURL("sidebar/sidebar.html");
-    // After navigating to the host's video, rejoin the same room automatically.
-    const sess = storedSession();
-    if (sess && sess.code) {
-      src += `?rejoin=${encodeURIComponent(sess.code)}&role=${sess.role === "host" ? "host" : "guest"}`;
+    const r = readRejoin();
+    if (r) {
+      src += `?rejoin=${encodeURIComponent(r.code)}&role=${r.role === "host" ? "host" : "guest"}`;
+      clearRejoin(); // one-shot: never rejoin again on later opens
     }
     frame.src = src;
     // Camera/mic permission is scoped to the extension origin, so one grant
@@ -76,71 +90,6 @@
     frame?.contentWindow?.postMessage({ source: "watchparty-host", ...msg }, "*");
   }
 
-  /* --------------------------- playback sync bridge --------------------------- */
-
-  let video = null;
-  let suppressUntil = 0; // ignore events we caused ourselves for a moment
-
-  const onPlay = () => report("play");
-  const onPause = () => report("pause");
-  const onSeeked = () => report("seek");
-
-  function report(kind) {
-    if (!video || Date.now() < suppressUntil) return;
-    post({ action: "video-event", kind, time: video.currentTime || 0 });
-  }
-
-  function bindVideo(v) {
-    if (video === v) return;
-    if (video) {
-      video.removeEventListener("play", onPlay);
-      video.removeEventListener("pause", onPause);
-      video.removeEventListener("seeked", onSeeked);
-    }
-    video = v;
-    if (video) {
-      video.addEventListener("play", onPlay);
-      video.addEventListener("pause", onPause);
-      video.addEventListener("seeked", onSeeked);
-    }
-  }
-
-  // The page's main video: the largest one that is actually rendered.
-  function pickVideo() {
-    const vids = [...document.querySelectorAll("video")].filter(
-      (v) => v.offsetWidth > 0 && v.offsetHeight > 0
-    );
-    vids.sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight);
-    bindVideo(vids[0] || null);
-    return video;
-  }
-
-  // Seek through the page-world bridge: on Netflix (and similar DRM players)
-  // setting video.currentTime is rejected, so the bridge calls the site's own
-  // player API; everywhere else it falls back to currentTime.
-  function seekTo(time) {
-    if (typeof time !== "number") return;
-    window.postMessage({ source: "watchparty-bridge", action: "seek", time }, "*");
-  }
-
-  function applyControl(cmd, time) {
-    const v = pickVideo();
-    if (!v) return;
-    // Wider window than the local-play case: the bridge round-trip plus a
-    // Netflix API seek can take a beat, and we must not echo it back.
-    suppressUntil = Date.now() + 1500;
-    if (cmd === "play") {
-      if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) seekTo(time);
-      v.play().catch(() => {});
-    } else if (cmd === "pause") {
-      v.pause();
-      if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) seekTo(time);
-    } else if (cmd === "seek" && typeof time === "number") {
-      seekTo(time);
-    }
-  }
-
-  // Inject the page-world bridge once, so seeks can reach site player APIs.
   function injectBridge() {
     if (document.getElementById("watchparty-bridge-script")) return;
     const s = document.createElement("script");
@@ -149,10 +98,54 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
-  // SPA sites swap their <video> without navigation — re-pick periodically.
-  setInterval(() => {
-    if (isOpen && video && !video.isConnected) pickVideo();
-  }, 5000);
+  /* ------------------------ frame-agent coordination ----------------------- */
+  // Each frame's agent reports the video it found and applies control commands.
+  // We track them all and treat the largest video as the active one.
+
+  const frames = new Map(); // WindowProxy -> {has, paused, time, area, at}
+
+  function activeFrame() {
+    let best = null;
+    const now = Date.now();
+    for (const [src, s] of frames) {
+      if (now - s.at > 9000) { frames.delete(src); continue; }
+      if (s.has && (!best || s.area > best.area)) best = s;
+    }
+    return best;
+  }
+
+  function relayState() {
+    const a = activeFrame();
+    post({
+      action: "video-state",
+      available: !!a,
+      paused: a ? a.paused : true,
+      time: a ? a.time : 0,
+      // Content sync always navigates to the TOP page URL, not an embed's URL.
+      href: location.href,
+    });
+  }
+
+  // Broadcast a control/query into the frame tree. The top agent (same window)
+  // applies it and forwards to child frames, which forward further down.
+  function broadcastCtrl(cmd, time) {
+    window.postMessage({ __wpCtrl: 1, cmd, time }, "*");
+  }
+  function broadcastQuery() {
+    window.postMessage({ __wpQuery: 1 }, "*");
+  }
+
+  function seekTo(time) {
+    if (typeof time !== "number") return;
+    window.postMessage({ source: "watchparty-bridge", action: "seek", time }, "*");
+  }
+
+  function applyControl(cmd, time) {
+    // Netflix and other top-frame DRM players seek only via their own API.
+    if (cmd === "seek" && typeof time === "number") seekTo(time);
+    // Every frame-agent (generic pages and cross-origin embeds) handles the rest.
+    broadcastCtrl(cmd, time);
+  }
 
   /* -------------------------------- messaging -------------------------------- */
 
@@ -164,38 +157,58 @@
 
   window.addEventListener("message", (e) => {
     const d = e.data;
-    if (!d || d.source !== "watchparty") return;
+    if (!d) return;
+
+    // Reports coming up from the frame-agents.
+    if (d.__wpAgent) {
+      if (d.t === "state") {
+        frames.set(e.source, {
+          has: !!d.has, paused: !!d.paused, time: Number(d.time) || 0,
+          area: Number(d.area) || 0, at: Date.now(),
+        });
+        relayState();
+      } else if (d.t === "event") {
+        const s = frames.get(e.source);
+        if (s) {
+          s.time = Number(d.time) || 0; s.at = Date.now();
+          if (d.kind === "play") s.paused = false;
+          else if (d.kind === "pause") s.paused = true;
+        }
+        const a = activeFrame();
+        // Only the active (largest) video's events drive the room.
+        if (a && frames.get(e.source) === a) {
+          post({ action: "video-event", kind: d.kind, time: Number(d.time) || 0 });
+        }
+      }
+      return;
+    }
+
+    // Messages from the sidebar iframe.
+    if (d.source !== "watchparty") return;
     if (frame && e.source !== frame.contentWindow) return;
     if (d.action === "close") {
       setOpen(false);
     } else if (d.action === "video-query") {
-      const v = pickVideo();
-      post({
-        action: "video-state",
-        available: !!v,
-        paused: v ? v.paused : true,
-        time: v ? v.currentTime : 0,
-        href: location.href,
-      });
+      broadcastQuery();
+      relayState(); // answer immediately with what we already know
     } else if (d.action === "video-control") {
       applyControl(String(d.cmd || ""), d.time);
-    } else if (d.action === "session") {
-      // The sidebar joined/created a room — remember it so we can rejoin after
-      // navigating to the host's video (survives same-site navigation).
-      try {
-        sessionStorage.setItem(
-          "watchparty-session",
-          JSON.stringify({ code: String(d.code || ""), role: d.role === "host" ? "host" : "guest" })
-        );
-      } catch {}
-    } else if (d.action === "clear-session") {
-      try { sessionStorage.removeItem("watchparty-session"); } catch {}
     } else if (d.action === "navigate") {
       const url = String(d.url || "");
       if (url && url !== location.href) {
-        try { sessionStorage.setItem("watchparty-open", "1"); } catch {}
-        location.assign(url); // rejoin happens after the reload (see ensureFrame)
+        // One-shot handoff so the sidebar rejoins this room after the reload.
+        try {
+          sessionStorage.setItem("watchparty-rejoin", JSON.stringify({
+            code: String(d.code || ""),
+            role: d.role === "host" ? "host" : "guest",
+            at: Date.now(),
+          }));
+          sessionStorage.setItem("watchparty-open", "1");
+        } catch {}
+        location.assign(url);
       }
+    } else if (d.action === "clear-session") {
+      clearRejoin();
     }
   });
 
@@ -204,12 +217,13 @@
     saved = sessionStorage.getItem("watchparty-open");
   } catch {}
   const autoOpen = AUTO_OPEN_HOSTS.test(location.hostname) || isAmazonVideo;
-  const hasSession = !!storedSession();
+  const rejoining = !!readRejoin();
 
   const start = () => {
     (document.body || document.documentElement).appendChild(btn);
-    // A stored session means we navigated to the host's video and must rejoin.
-    if (hasSession || saved === "1" || (autoOpen && saved !== "0")) setOpen(true);
+    // Open on load only to finish a content-sync handoff, to restore an
+    // explicitly-opened panel, or on the streaming sites that auto-open.
+    if (rejoining || saved === "1" || (autoOpen && saved !== "0")) setOpen(true);
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", start);

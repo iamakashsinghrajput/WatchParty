@@ -807,9 +807,12 @@ function onOpenVideo(url) {
   if (state.pageHref && sameVideo(url, state.pageHref)) return;
   state.navigating = true;
   addSystem("Opening the host's video…");
-  // Session is already persisted (see enterRoom); the content script stores it
-  // and navigates, then the sidebar reloads and auto-rejoins this same room.
-  parent.postMessage({ source: "watchparty", action: "navigate", url }, "*");
+  // The content script stores a ONE-SHOT rejoin (code + role) and navigates;
+  // after the reload the sidebar auto-rejoins this same room exactly once.
+  parent.postMessage(
+    { source: "watchparty", action: "navigate", url, code: state.room, role: state.role },
+    "*"
+  );
 }
 
 function toggleGrant(e) {
@@ -923,14 +926,6 @@ function enterRoom() {
   attachLocal();
   layoutGrid();
   queryPageVideo();
-  // Persist the room in the page so it survives the guest navigating to the
-  // host's video (the content script re-opens the sidebar with ?rejoin).
-  if (FRAMED && state.room) {
-    parent.postMessage(
-      { source: "watchparty", action: "session", code: state.room, role: state.role },
-      "*"
-    );
-  }
 }
 
 function enableChat(on) {

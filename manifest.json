@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WatchParty — Watch Together",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Watch together from anywhere: camera and chat beside the video, rooms for up to six friends, reactions and playback sync.",
   "permissions": ["activeTab", "scripting"],
   "action": {
@@ -45,6 +45,27 @@
       "css": ["content.css"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": [
+        "https://*.netflix.com/*",
+        "https://*.youtube.com/*",
+        "https://youtu.be/*",
+        "https://*.primevideo.com/*",
+        "https://*.amazon.com/*",
+        "https://*.amazon.in/*",
+        "https://*.amazon.co.uk/*",
+        "https://*.amazon.de/*",
+        "https://*.amazon.co.jp/*",
+        "https://*.disneyplus.com/*",
+        "https://*.hotstar.com/*",
+        "https://*.hulu.com/*",
+        "https://*.max.com/*",
+        "https://*.crunchyroll.com/*"
+      ],
+      "js": ["frame-agent.js"],
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "web_accessible_resources": [
