@@ -1339,8 +1339,9 @@ function renderAuthUI() {
 
 // A Web-application OAuth client id, used with launchWebAuthFlow so sign-in
 // works in Brave/Edge/Vivaldi as well as Chrome (getAuthToken is Chrome-only).
-// Set once you've made the Web client, or via localStorage "wp-webclient".
-const DEFAULT_WEB_CLIENT_ID = "";
+// Only the CLIENT ID goes here — never the client secret (this is a public
+// client). Overridable at runtime via localStorage "wp-webclient".
+const DEFAULT_WEB_CLIENT_ID = "570897047586-obh6j98a93u8fkbftdlvl49eahvp61tn.apps.googleusercontent.com";
 const WEB_CLIENT_ID = store.get("wp-webclient") || DEFAULT_WEB_CLIENT_ID;
 
 function signInFail(msg) {
