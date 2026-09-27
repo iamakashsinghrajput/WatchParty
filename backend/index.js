@@ -7,6 +7,19 @@
 import express from "express";
 import cors from "cors";
 import { MongoClient } from "mongodb";
+import fs from "fs";
+
+// Load a local .env for development (gitignored). Existing env vars — e.g.
+// Railway's own Variables in production — always win.
+try {
+  const text = fs.readFileSync(new URL("./.env", import.meta.url), "utf8");
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (m && !line.trimStart().startsWith("#") && !process.env[m[1]]) {
+      process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    }
+  }
+} catch {}
 
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
