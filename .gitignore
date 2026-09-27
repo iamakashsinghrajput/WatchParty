@@ -3,3 +3,7 @@ node_modules/
 *.zip
 test/sample.mp4
 test/embed-*.html
+test/fixed-player.html
+test/embed-top.html
+test/embed-blank.html
+test/embed-outer-same.html

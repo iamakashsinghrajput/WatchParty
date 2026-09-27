@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WatchParty — Watch Together",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Watch together from anywhere: camera and chat beside the video, rooms for up to six friends, reactions and playback sync.",
   "permissions": ["activeTab", "scripting"],
   "action": {

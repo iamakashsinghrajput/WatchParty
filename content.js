@@ -220,7 +220,9 @@
   const rejoining = !!readRejoin();
 
   const start = () => {
-    (document.body || document.documentElement).appendChild(btn);
+    // Attach to <html>, not <body>: the page-shrink transform is on <html>, so
+    // a child of <html> stays put while the page (in <body>) reflows.
+    document.documentElement.appendChild(btn);
     // Open on load only to finish a content-sync handoff, to restore an
     // explicitly-opened panel, or on the streaming sites that auto-open.
     if (rejoining || saved === "1" || (autoOpen && saved !== "0")) setOpen(true);
