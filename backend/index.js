@@ -24,9 +24,17 @@ try {
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.DB_NAME || "watchparty";
-const GOOGLE_CLIENT_ID =
+// Accept tokens issued for either of our OAuth clients: the Web client (used by
+// launchWebAuthFlow in Brave/Edge/Chrome) and the Chrome-extension client (used
+// by getAuthToken on Chrome). GOOGLE_CLIENT_ID may be a comma-separated list.
+const GOOGLE_CLIENT_IDS = (
   process.env.GOOGLE_CLIENT_ID ||
-  "570897047586-b71eq79nrrrln298h2kjctpi27o3se48.apps.googleusercontent.com";
+  "570897047586-obh6j98a93u8fkbftdlvl49eahvp61tn.apps.googleusercontent.com," +
+    "570897047586-b71eq79nrrrln298h2kjctpi27o3se48.apps.googleusercontent.com"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!MONGODB_URI) {
   console.error("MONGODB_URI environment variable is required.");
@@ -60,7 +68,7 @@ async function verify(req) {
     if (!ti.ok) return null;
     const info = await ti.json();
     const aud = info.aud || info.azp;
-    if (aud !== GOOGLE_CLIENT_ID) return null;
+    if (!GOOGLE_CLIENT_IDS.includes(aud)) return null;
     // userinfo gives the display name and picture.
     const ui = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
       headers: { Authorization: "Bearer " + token },

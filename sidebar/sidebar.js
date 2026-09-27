@@ -1375,8 +1375,20 @@ async function completeSignIn(token) {
     renderAuthUI();
     renderProfileUI();
     addSystem(`Signed in as ${account.name || account.email}.`);
-    const server = await backendFetch("/auth", { method: "POST" });
-    if (server) { applyServerProfile(server); renderAuthUI(); }
+    // Sync with the backend and tell the user what happened, so a silent
+    // failure to save doesn't look like success.
+    if (!BACKEND_URL) {
+      addSystem("Profile is on this device only — no sync backend is set yet.");
+    } else {
+      const server = await backendFetch("/auth", { method: "POST" });
+      if (server) {
+        applyServerProfile(server);
+        renderAuthUI();
+        addSystem("Profile saved to your account ✓");
+      } else {
+        addSystem("Signed in, but couldn't save to the backend — check it's deployed and the URL is set.");
+      }
+    }
     broadcast(profileMsg("hello"));
   } catch {
     signInFail("couldn't read Google profile — try again");
