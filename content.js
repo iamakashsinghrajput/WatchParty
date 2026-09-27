@@ -193,6 +193,15 @@
       relayState(); // answer immediately with what we already know
     } else if (d.action === "video-control") {
       applyControl(String(d.cmd || ""), d.time);
+    } else if (d.action === "persist-rejoin") {
+      // Keep a one-shot rejoin ready so this room survives a navigation.
+      try {
+        sessionStorage.setItem("watchparty-rejoin", JSON.stringify({
+          code: String(d.code || ""),
+          role: d.role === "host" ? "host" : "guest",
+          at: Date.now(),
+        }));
+      } catch {}
     } else if (d.action === "navigate") {
       const url = String(d.url || "");
       if (url && url !== location.href) {

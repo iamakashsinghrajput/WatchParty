@@ -47,6 +47,15 @@ function loadProfile() {
 
 const profile = loadProfile();
 
+// A stable per-user id that survives page reloads (unlike the ephemeral peer
+// id). "Who holds the remote" is tracked by this, so control can be handed to
+// someone and survive everyone navigating to a new video.
+let myUid = store.get("wp-uid");
+if (!myUid) {
+  myUid = "u" + Math.random().toString(36).slice(2, 10);
+  store.set("wp-uid", myUid);
+}
+
 function saveProfile() {
   store.set("wp-profile", JSON.stringify(profile));
   store.set("wp-name", profile.name);
@@ -55,6 +64,7 @@ function saveProfile() {
 function profileMsg(type, extra) {
   return Object.assign({
     type,
+    uid: myUid,
     name: profile.name,
     color: profile.color,
     avatar: profile.avatar,
@@ -75,14 +85,14 @@ const state = {
   role: null,           // "host" | "guest"
   room: null,
   pageVideo: false,     // the page under the sidebar has a <video> to sync
-  canControl: false,    // guest: the host handed us the remote
-  allowed: new Set(),   // host: peer ids allowed to control playback
+  controllerUid: null,  // uid of whoever currently drives content + playback
   lastVideo: null,      // {paused, time, at} last known local page-video state
-  pendingTick: null,    // host position report awaiting local comparison
-  hostState: null,      // guest: {paused, time, at} the host's authoritative state
+  pendingTick: null,    // position report awaiting local comparison
+  controllerState: null,// {paused, time, at} the controller's authoritative state
   pageHref: "",         // the URL of the page under the sidebar
-  lastSharedUrl: "",    // host: last video URL broadcast to the room
-  navigating: false,    // guest: currently opening the host's video
+  lastSharedUrl: "",    // the last video URL I broadcast (while controller)
+  lastRoomUrl: "",      // the room's current video URL (for newcomers)
+  navigating: false,    // currently opening the controller's video
   view: "lobby",        // "lobby" | "room" | "profile"
   viewBefore: "lobby",
 };
@@ -393,6 +403,7 @@ function entry(pid) {
   if (!e) {
     e = {
       id: pid,
+      uid: null,
       profile: { name: "Guest", color: "", avatar: "🍿", badge: "" },
       conn: null, call: null, tile: null, video: null, tag: null, announced: false,
     };
@@ -428,18 +439,23 @@ function registerConn(conn, outgoing) {
   if (!outgoing && conn.metadata?.name) setPeerProfile(e, conn.metadata);
   conn.on("open", () => {
     conn.send(profileMsg("hello"));
-    // The host introduces the newcomer to everyone already in the room; the
-    // newcomer then dials each of them directly (full mesh).
+    // The host introduces the newcomer to everyone already in the room, tells
+    // them who holds the remote and what's playing, and lands them at the
+    // current position. The newcomer then dials the others directly (mesh).
     if (state.role === "host") {
       const others = [...state.peers.values()]
         .filter((x) => x.id !== conn.peer && x.conn?.open)
         .map((x) => ({ id: x.id }));
       conn.send({ type: "roster", peers: others });
-      // Auto-open the host's current video on the newcomer's screen.
-      if (state.pageVideo && state.pageHref) conn.send({ type: "open-video", url: state.pageHref });
-      // Land the newcomer at the host's current position and play state.
-      const lv = latestVideoState();
-      if (lv) conn.send({ type: "sync-state", time: lv.time, paused: lv.paused });
+      conn.send({ type: "controller", uid: state.controllerUid });
+      const url = iAmController() ? state.pageHref : state.lastRoomUrl;
+      if (url) conn.send({ type: "open-video", url, uid: state.controllerUid });
+      const cs = controllerCurrentState();
+      if (cs) conn.send({ type: "sync-tick", time: cs.time, paused: cs.paused, uid: state.controllerUid });
+      // If this uid was the controller before a reconnect, restore its remote.
+      if (e.uid && e.uid === state.controllerUid && e.uid !== myUid) {
+        conn.send({ type: "controller", uid: state.controllerUid });
+      }
     }
     announce(e);
     refreshStatus();
@@ -466,7 +482,7 @@ function registerCall(call, outgoing) {
 function dialPeer(pid) {
   if (!state.peer || pid === state.peer.id) return;
   if (state.peers.get(pid)?.conn) return;
-  const meta = { name: profile.name, color: profile.color, avatar: profile.avatar, badge: profile.badge };
+  const meta = { uid: myUid, name: profile.name, color: profile.color, avatar: profile.avatar, badge: profile.badge };
   registerConn(state.peer.connect(pid, { metadata: meta }), true);
   registerCall(state.peer.call(pid, state.stream, { metadata: meta }), true);
 }
@@ -492,25 +508,16 @@ function handleData(e, msg) {
     case "sync":
       onRemoteSync(e, msg);
       break;
-    case "sync-req":
-      onSyncRequest(e, msg);
-      break;
-    case "sync-state":
     case "sync-tick":
-      onHostTick(e, msg);
+      onControllerTick(e, msg);
       break;
     case "open-video":
-      if (e.id === hostId()) onOpenVideo(String(msg.url || ""));
+      if (state.role === "host") state.lastRoomUrl = String(msg.url || "");
+      onOpenVideo(String(msg.uid || e.uid || ""), String(msg.url || ""));
       break;
-    case "ctrl":
-      if (e.id === hostId()) {
-        state.canControl = !!msg.allowed;
-        addSystem(
-          state.canControl
-            ? `${e.profile.name} gave you the remote — you can control playback now`
-            : `${e.profile.name} took back playback control`
-        );
-      }
+    case "controller":
+      // Only the host assigns the remote; everyone else trusts that.
+      if (isHostPeer(e)) applyController(String(msg.uid || ""));
       break;
     case "full":
       setStatus("err", "Room is full");
@@ -531,9 +538,21 @@ function sanitizeProfile(src) {
   };
 }
 
+// The host is the peer whose id is the room code.
+function isHostPeer(e) {
+  return state.role === "guest" && e.id === state.room;
+}
+
 function setPeerProfile(e, src) {
   e.profile = sanitizeProfile(src);
+  if (src.uid) e.uid = String(src.uid);
   if (e.tag) e.tag.textContent = e.profile.name;
+  // A returning controller (same uid, new peer id) gets its remote restored.
+  if (state.role === "host" && e.uid && e.uid === state.controllerUid) {
+    clearTimeout(reclaimTimer);
+    updateGrantButtons();
+    if (e.conn?.open) e.conn.send({ type: "controller", uid: state.controllerUid });
+  }
 }
 
 function announce(e) {
@@ -541,6 +560,8 @@ function announce(e) {
   e.announced = true;
   feedEvent(e.profile, "joined the party 🎉");
 }
+
+let reclaimTimer = null;
 
 function removePeer(pid) {
   const e = state.peers.get(pid);
@@ -551,6 +572,16 @@ function removePeer(pid) {
   try { e.audioNode?.disconnect(); } catch {}
   e.tile?.remove();
   if (e.announced) feedEvent(e.profile, "left the party");
+  // If the person who held the remote just dropped, give them a moment to
+  // reconnect (they may be navigating); if they don't come back, the host
+  // takes the remote back so the room isn't stuck.
+  if (state.role === "host" && e.uid && e.uid === state.controllerUid && e.uid !== myUid) {
+    clearTimeout(reclaimTimer);
+    reclaimTimer = setTimeout(() => {
+      const stillHere = [...state.peers.values()].some((p) => p.uid === state.controllerUid);
+      if (!stillHere) setController(myUid);
+    }, 12000);
+  }
   layoutGrid();
   refreshStatus();
   if (state.peers.size === 0) enableChat(false);
@@ -587,14 +618,17 @@ async function createRoom() {
   primeAudio(); // this click is a user gesture — unlock audio playback now
   await ensureStream();
   state.role = "host";
+  state.controllerUid = myUid; // the host starts holding the remote
   startHost(makeCode(), 0, false);
 }
 
-// Re-create a room on the same code after the host navigated to a new video.
+// Re-create a room on the same code after the controller navigated to a new
+// video (the host must reclaim the room and restore who holds the remote).
 async function rehostRoom(code) {
   if (state.peer || !requireName()) return;
   await ensureStream();
   state.role = "host";
+  state.controllerUid = store.get("wp-ctrl-" + code) || myUid;
   startHost(code, 0, true);
 }
 
@@ -604,6 +638,8 @@ function startHost(code, attempt, keepCode) {
   state.peer = p;
   p.on("open", (id) => {
     state.room = id;
+    if (!state.controllerUid) state.controllerUid = myUid;
+    persistController();
     enterRoom();
     refreshStatus();
     if (!keepCode) feedEvent(profile, "created the party 🎉");
@@ -673,16 +709,20 @@ function handlePeerError(err) {
 function leaveRoom() {
   broadcast({ type: "bye" });
   try { state.peer?.destroy(); } catch {}
+  if (state.room) store.del("wp-ctrl-" + state.room);
   if (FRAMED) parent.postMessage({ source: "watchparty", action: "clear-session" }, "*");
   setTimeout(() => location.reload(), 200);
 }
 
-/* ------------------------------ playback sync ------------------------------ */
-// Host-authoritative, always on: the room creator's player is the source of
-// truth. Guests follow automatically (play/pause/seek and position). Only the
-// host controls playback, unless the host hands a guest the remote.
+/* --------------------------- controller-driven sync --------------------------- */
+// One person holds the remote at a time — the "controller" (the host by
+// default). The controller drives BOTH what's playing (the video URL) and
+// playback (play/pause/seek/position); everyone else follows and cannot
+// diverge. The host can hand the remote to a guest, and it survives everyone
+// navigating to the new video (the remote is tracked by a stable user id).
 
 let lastSyncSent = 0;
+let lastSyncKind = "";
 let lastSeekFeed = 0;
 let lastNoCtrlNote = 0;
 
@@ -699,7 +739,13 @@ const syncEventText = (kind, time) =>
   : kind === "pause" ? "paused the video"
   : `jumped to ${fmtTime(time)}`;
 
-const hostId = () => (state.role === "guest" ? state.room : null);
+const iAmController = () => state.controllerUid === myUid;
+
+function controllerProfile() {
+  if (iAmController()) return profile;
+  for (const e of state.peers.values()) if (e.uid === state.controllerUid) return e.profile;
+  return { name: "the host" };
+}
 
 function queryPageVideo() {
   if (FRAMED) parent.postMessage({ source: "watchparty", action: "video-query" }, "*");
@@ -722,89 +768,145 @@ function feedSyncEvent(p, kind, time) {
   feedEvent(p, syncEventText(kind, time));
 }
 
-// The host's current player position, extrapolated from the last poll.
+// My current player position, extrapolated (used when I'm the controller).
 function latestVideoState() {
   const lv = state.lastVideo;
   if (!lv) return null;
-  return {
-    paused: lv.paused,
-    time: lv.time + (lv.paused ? 0 : (Date.now() - lv.at) / 1000),
-  };
+  return { paused: lv.paused, time: lv.time + (lv.paused ? 0 : (Date.now() - lv.at) / 1000) };
 }
 
-// The host's expected current position, extrapolated from its last report.
-function hostExpectedTime() {
-  const hs = state.hostState;
-  if (!hs) return 0;
-  return hs.time + (hs.paused ? 0 : (Date.now() - hs.at) / 1000);
+// The controller's current position — my own if I'm controlling, else the last
+// state I heard from the controller, extrapolated forward.
+function controllerCurrentState() {
+  if (iAmController()) return latestVideoState();
+  const cs = state.controllerState;
+  if (!cs) return null;
+  return { paused: cs.paused, time: cs.time + (cs.paused ? 0 : (Date.now() - cs.at) / 1000) };
 }
 
-// Record the host's authoritative state on the guest side.
-function noteHostState(kind, time) {
-  const prev = state.hostState;
+function noteControllerState(kind, time) {
+  const prev = state.controllerState;
   let paused = prev ? prev.paused : true;
   if (kind === "play") paused = false;
   else if (kind === "pause") paused = true;
-  state.hostState = { paused, time: Number(time) || 0, at: Date.now() };
+  state.controllerState = { paused, time: Number(time) || 0, at: Date.now() };
 }
 
-// This user touched their own player (play/pause/seek).
+// This user touched their own player.
 function onPageVideoEvent(d) {
   if (!state.room) return;
   const now = Date.now();
-  if (now - lastSyncSent < 250) return;
+  // Coalesce only rapid repeats of the SAME kind (e.g. scrubbing fires many
+  // seeks); never drop a play/pause that lands right after a seek.
+  if (d.kind === lastSyncKind && now - lastSyncSent < 250) return;
   lastSyncSent = now;
-  if (state.role === "host") {
-    broadcast({ type: "sync", kind: d.kind, time: d.time, by: profile.name });
-    feedSyncEvent(profile, d.kind, d.time);
-  } else if (state.canControl) {
-    const host = state.peers.get(hostId());
-    if (host?.conn?.open) host.conn.send({ type: "sync-req", kind: d.kind, time: d.time });
+  lastSyncKind = d.kind;
+  if (iAmController()) {
+    // I hold the remote — my action drives everyone.
+    broadcast({ type: "sync", kind: d.kind, time: d.time, uid: myUid });
     feedSyncEvent(profile, d.kind, d.time);
   } else {
-    // No remote: the guest cannot diverge — snap their player back to the
-    // host's current state so they can only watch what the host is watching.
-    if (state.hostState) applySyncLocal(state.hostState.paused ? "pause" : "play", hostExpectedTime());
+    // I don't hold the remote — snap back to the controller so I can't diverge.
+    const cs = controllerCurrentState();
+    if (cs) applySyncLocal(cs.paused ? "pause" : "play", cs.time);
     if (now - lastNoCtrlNote > 8000) {
       lastNoCtrlNote = now;
-      addSystem("Only the host controls playback — ask them to hand you the remote.");
+      addSystem(`${controllerProfile().name} has the remote — ask them to hand it to you.`);
     }
   }
 }
 
-// A sync command arrived. Guests obey the host and no one else.
+// A playback command from the controller — everyone else applies it.
 function onRemoteSync(e, msg) {
-  if (state.role !== "guest" || e.id !== hostId()) return;
+  if (String(msg.uid || e.uid) !== state.controllerUid) return; // only the controller
   const kind = String(msg.kind || "");
   if (!["play", "pause", "seek"].includes(kind)) return;
-  noteHostState(kind, msg.time);
-  if (msg.by === profile.name) return; // our own action, echoed back by the host
-  const src =
-    [...state.peers.values()].find((p) => p.profile.name === msg.by)?.profile || e.profile;
-  feedSyncEvent(src, kind, msg.time);
+  noteControllerState(kind, msg.time);
+  if (state.controllerUid === myUid) return; // I'm the controller; ignore echoes
+  feedSyncEvent(controllerProfile(), kind, msg.time);
   applySyncLocal(kind, msg.time);
 }
 
-// An authorized guest asked the host to change playback.
-function onSyncRequest(e, msg) {
-  if (state.role !== "host" || !state.allowed.has(e.id)) return;
-  const kind = String(msg.kind || "");
-  if (!["play", "pause", "seek"].includes(kind)) return;
-  applySyncLocal(kind, msg.time);
-  broadcast({ type: "sync", kind, time: msg.time, by: e.profile.name });
-  feedSyncEvent(e.profile, kind, msg.time);
-}
-
-// Position report from the host (on join, then every ~10s) — correct drift.
-function onHostTick(e, msg) {
-  if (state.role !== "guest" || e.id !== hostId()) return;
-  state.hostState = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
+// Position heartbeat from the controller — correct drift / land newcomers.
+function onControllerTick(e, msg) {
+  if (String(msg.uid || e.uid) !== state.controllerUid) return;
+  if (iAmController()) return;
+  state.controllerState = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
   state.pendingTick = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
   queryPageVideo();
 }
 
+/* --------------------------- who holds the remote --------------------------- */
+
+function persistRejoinIfDriving() {
+  // The host and the current controller keep a one-shot rejoin ready so the
+  // room survives them navigating to a new video; nobody else does.
+  if (!FRAMED || !state.room) return;
+  if (state.role === "host" || iAmController()) {
+    parent.postMessage(
+      { source: "watchparty", action: "persist-rejoin", code: state.room, role: state.role },
+      "*"
+    );
+  }
+}
+
+function persistController() {
+  if (state.room) store.set("wp-ctrl-" + state.room, state.controllerUid || "");
+}
+
+// The host assigns the remote (to a guest, or back to itself) and tells everyone.
+function setController(uid) {
+  if (state.role !== "host") return;
+  state.controllerUid = uid || myUid;
+  persistController();
+  broadcast({ type: "controller", uid: state.controllerUid });
+  onControllerChanged();
+}
+
+// Everyone (including the host) reacts to a change of who holds the remote.
+function applyController(uid) {
+  if (uid === state.controllerUid) return;
+  state.controllerUid = uid || null;
+  onControllerChanged();
+}
+
+function onControllerChanged() {
+  updateGrantButtons();
+  const name = iAmController() ? "You" : controllerProfile().name;
+  addSystem(iAmController() ? "You now hold the remote — everyone follows your video." : `${name} now holds the remote.`);
+  if (iAmController()) {
+    // I'm driving now: (re)share my current video + position, and keep a rejoin
+    // ready so my navigations carry the room along.
+    state.lastSharedUrl = "";
+    persistRejoinIfDriving();
+    shareMyVideo();
+    const cs = latestVideoState();
+    if (cs) broadcast({ type: "sync-tick", time: cs.time, paused: cs.paused, uid: myUid });
+  } else if (state.role !== "host") {
+    // I no longer drive — a plain guest shouldn't keep the room sticky.
+    if (FRAMED) parent.postMessage({ source: "watchparty", action: "clear-session" }, "*");
+  }
+}
+
+function updateGrantButtons() {
+  for (const e of state.peers.values()) {
+    if (!e.grantBtn) continue;
+    const on = e.uid && e.uid === state.controllerUid;
+    e.grantBtn.classList.toggle("on", on);
+    e.grantBtn.title = on
+      ? `${e.profile.name} holds the remote — click to take it back`
+      : `Hand ${e.profile.name} the remote`;
+  }
+}
+
+// Host clicks the remote button on a guest's tile.
+function toggleGrant(e) {
+  if (state.role !== "host" || !e.uid) return;
+  setController(e.uid === state.controllerUid ? myUid : e.uid);
+}
+
 /* ------------------------------ content sync ------------------------------- */
-// The host shares which video it's watching; invited members auto-open it.
+// The controller shares which video everyone watches; the rest auto-open it.
 
 function sameVideo(a, b) {
   try {
@@ -815,44 +917,32 @@ function sameVideo(a, b) {
   }
 }
 
-// The host is on a watch page — share its URL with the room (once per change).
-function shareHostVideo() {
-  if (state.role !== "host" || !state.pageVideo || !state.pageHref) return;
+// I'm the controller on a watch page — share its URL with the room.
+function shareMyVideo() {
+  if (!iAmController() || !state.pageVideo || !state.pageHref) return;
   if (state.pageHref === state.lastSharedUrl) return;
   state.lastSharedUrl = state.pageHref;
-  broadcast({ type: "open-video", url: state.pageHref });
+  state.lastRoomUrl = state.pageHref;
+  broadcast({ type: "open-video", url: state.pageHref, uid: myUid });
 }
 
-// A guest is told which video the host is watching — open it if different.
-function onOpenVideo(url) {
-  if (!FRAMED || state.role !== "guest" || !url) return;
+// The controller changed the video — everyone else opens it.
+function onOpenVideo(fromUid, url) {
+  if (!FRAMED || !url) return;
+  if (fromUid !== state.controllerUid) return; // only follow the controller
+  if (iAmController()) return;                  // don't follow myself
   if (state.navigating) return;
   if (state.pageHref && sameVideo(url, state.pageHref)) return;
   state.navigating = true;
-  addSystem("Opening the host's video…");
-  // The content script stores a ONE-SHOT rejoin (code + role) and navigates;
-  // after the reload the sidebar auto-rejoins this same room exactly once.
+  // Safety: if the navigation doesn't actually happen (blocked, same page),
+  // clear the flag so a later video change still gets followed.
+  setTimeout(() => { state.navigating = false; }, 6000);
+  addSystem(`Opening ${controllerProfile().name}'s video…`);
+  // Store a one-shot rejoin (code + my role) and navigate; the sidebar
+  // auto-rejoins this same room once, on the new page.
   parent.postMessage(
     { source: "watchparty", action: "navigate", url, code: state.room, role: state.role },
     "*"
-  );
-}
-
-function toggleGrant(e) {
-  const allowed = !state.allowed.has(e.id);
-  if (allowed) state.allowed.add(e.id);
-  else state.allowed.delete(e.id);
-  e.grantBtn?.classList.toggle("on", allowed);
-  if (e.grantBtn) {
-    e.grantBtn.title = allowed
-      ? `${e.profile.name} has the remote — click to take it back`
-      : `Hand ${e.profile.name} the remote (play/pause/seek)`;
-  }
-  if (e.conn?.open) e.conn.send({ type: "ctrl", allowed });
-  addSystem(
-    allowed
-      ? `${e.profile.name} can now control playback`
-      : `${e.profile.name} can no longer control playback`
   );
 }
 
@@ -949,6 +1039,7 @@ function enterRoom() {
   attachLocal();
   layoutGrid();
   queryPageVideo();
+  persistRejoinIfDriving(); // host/controller keep the room across navigation
 }
 
 function enableChat(on) {
@@ -1029,6 +1120,7 @@ function addTile(e) {
   e.tile = tile;
   e.video = vid;
   e.tag = tag;
+  updateGrantButtons(); // reflect who currently holds the remote
   layoutGrid();
 }
 
@@ -1325,8 +1417,8 @@ function wire() {
         state.lastVideo = { paused: !!d.paused, time: Number(d.time) || 0, at: Date.now() };
       }
       updateLobbyButtons();
-      shareHostVideo(); // host: broadcast this watch URL to the room
-      // A guest compares the host's reported position against its own player.
+      shareMyVideo(); // if I hold the remote, broadcast this watch URL
+      // A follower compares the controller's reported position against its own.
       if (state.pendingTick && Date.now() - state.pendingTick.at < 3000 && state.pageVideo) {
         const t = state.pendingTick;
         state.pendingTick = null;
@@ -1363,14 +1455,16 @@ async function init() {
   queryPageVideo();
 
   // Keep watching the page's video: gates the lobby until one is selected,
-  // and keeps the host's known position fresh for join-state and drift ticks.
+  // and keeps the controller's position fresh for join-state and drift ticks.
   if (FRAMED) setInterval(queryPageVideo, 4000);
   setInterval(() => {
-    if (state.role === "host" && state.room && FRAMED) {
+    if (iAmController() && state.room && FRAMED) {
       const lv = latestVideoState();
-      if (lv) broadcast({ type: "sync-tick", time: lv.time, paused: lv.paused });
+      if (lv) broadcast({ type: "sync-tick", time: lv.time, paused: lv.paused, uid: myUid });
     }
-  }, 10000);
+    // Keep the driving rejoin fresh so it never expires between navigations.
+    persistRejoinIfDriving();
+  }, 8000);
 
   // Auto-rejoin after the page navigated to the host's video (content script
   // re-opened the sidebar with ?rejoin once it saw a stored session).
