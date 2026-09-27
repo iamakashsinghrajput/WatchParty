@@ -1337,50 +1337,90 @@ function renderAuthUI() {
   updateLobbyButtons();
 }
 
+// A Web-application OAuth client id, used with launchWebAuthFlow so sign-in
+// works in Brave/Edge/Vivaldi as well as Chrome (getAuthToken is Chrome-only).
+// Set once you've made the Web client, or via localStorage "wp-webclient".
+const DEFAULT_WEB_CLIENT_ID = "";
+const WEB_CLIENT_ID = store.get("wp-webclient") || DEFAULT_WEB_CLIENT_ID;
+
+function signInFail(msg) {
+  addSystem("Google sign-in failed: " + msg);
+  setNote("Sign-in failed: " + msg);
+  console.warn("[watchparty] sign-in error:", msg);
+  $("googleSignIn").disabled = false;
+  $("lobbySignIn").disabled = false;
+}
+
+// Finish sign-in once we have an access token: fetch the profile, store it,
+// and sync with the backend.
+async function completeSignIn(token) {
+  try {
+    const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+      headers: { Authorization: "Bearer " + token },
+    });
+    const info = await res.json();
+    if (!info.sub) return signInFail("couldn't read Google profile");
+    account = {
+      sub: String(info.sub),
+      email: String(info.email || ""),
+      name: String(info.name || info.given_name || ""),
+      picture: String(info.picture || ""),
+      token,
+    };
+    store.set("wp-account", JSON.stringify(account));
+    myUid = computeUid();
+    if (!profile.name && account.name) profile.name = account.name.slice(0, 20);
+    saveProfile();
+    renderAuthUI();
+    renderProfileUI();
+    addSystem(`Signed in as ${account.name || account.email}.`);
+    const server = await backendFetch("/auth", { method: "POST" });
+    if (server) { applyServerProfile(server); renderAuthUI(); }
+    broadcast(profileMsg("hello"));
+  } catch {
+    signInFail("couldn't read Google profile — try again");
+  }
+}
+
 function signInWithGoogle() {
   if (!identityApi) {
     setNote("Google sign-in needs the installed extension (not the dev page).");
     return;
   }
-  const btn = $("googleSignIn");
-  btn.disabled = true;
-  identityApi.getAuthToken({ interactive: true }, async (token) => {
-    btn.disabled = false;
-    const lastErr = globalThis.chrome?.runtime?.lastError;
-    if (lastErr || !token) {
-      const msg = lastErr?.message || "cancelled";
-      addSystem("Google sign-in failed: " + msg);
-      setNote("Sign-in failed: " + msg);
-      console.warn("[watchparty] getAuthToken error:", msg);
-      return;
+  $("googleSignIn").disabled = true;
+  $("lobbySignIn").disabled = true;
+
+  // launchWebAuthFlow works in every Chromium browser (Brave included). Prefer
+  // it whenever a Web client id is configured.
+  if (WEB_CLIENT_ID) {
+    const redirectUri = identityApi.getRedirectURL();
+    const authUrl =
+      "https://accounts.google.com/o/oauth2/v2/auth?" +
+      new URLSearchParams({
+        client_id: WEB_CLIENT_ID,
+        response_type: "token",
+        redirect_uri: redirectUri,
+        scope: "openid email profile",
+        prompt: "select_account",
+      }).toString();
+    identityApi.launchWebAuthFlow({ url: authUrl, interactive: true }, (responseUrl) => {
+      const err = globalThis.chrome?.runtime?.lastError;
+      if (err || !responseUrl) return signInFail(err?.message || "cancelled");
+      let token = "";
+      try { token = new URLSearchParams(new URL(responseUrl).hash.slice(1)).get("access_token") || ""; } catch {}
+      if (!token) return signInFail("no access token returned");
+      completeSignIn(token);
+    });
+    return;
+  }
+
+  // Fallback: Chrome-only getAuthToken (no Web client configured).
+  identityApi.getAuthToken({ interactive: true }, (token) => {
+    const err = globalThis.chrome?.runtime?.lastError;
+    if (err || !token) {
+      return signInFail((err?.message || "cancelled") + " — Brave/Edge need a Web client (see setup).");
     }
-    try {
-      const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-        headers: { Authorization: "Bearer " + token },
-      });
-      const info = await res.json();
-      account = {
-        sub: String(info.sub || ""),
-        email: String(info.email || ""),
-        name: String(info.name || info.given_name || ""),
-        picture: String(info.picture || ""),
-        token,
-      };
-      store.set("wp-account", JSON.stringify(account));
-      myUid = computeUid();
-      // Adopt the Google name/photo the first time if the profile is bare.
-      if (!profile.name && account.name) profile.name = account.name.slice(0, 20);
-      saveProfile();
-      renderAuthUI();
-      renderProfileUI();
-      addSystem(`Signed in as ${account.name || account.email}.`);
-      // Pull this user's saved profile from the backend (syncs across devices).
-      const server = await backendFetch("/auth", { method: "POST" });
-      if (server) { applyServerProfile(server); renderAuthUI(); }
-      broadcast(profileMsg("hello"));
-    } catch {
-      addSystem("Couldn't read your Google profile — try again.");
-    }
+    completeSignIn(token);
   });
 }
 
