@@ -307,6 +307,34 @@ select { appearance: none; -webkit-appearance: none; cursor: pointer; }
   color: var(--text);
 }
 
+/* ------------------------------- auth ------------------------------- */
+
+.auth-box { display: flex; flex-direction: column; gap: 8px; }
+.google-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  background: #fff !important;
+  color: #1f1f1f !important;
+  border: 1px solid #dadce0 !important;
+  font-weight: 600;
+}
+.google-btn:hover { background: #f5f5f5 !important; }
+.auth-signed {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 9px 11px;
+}
+.auth-pic { width: 34px; height: 34px; border-radius: 50%; flex: none; background: var(--panel-2); object-fit: cover; }
+.auth-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.auth-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.auth-email { font-size: 11.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* -------------------------------- room -------------------------------- */
 
 .videos { position: relative; background: #000; flex: none; }

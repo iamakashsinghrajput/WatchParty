@@ -47,14 +47,23 @@ function loadProfile() {
 
 const profile = loadProfile();
 
-// A stable per-user id that survives page reloads (unlike the ephemeral peer
-// id). "Who holds the remote" is tracked by this, so control can be handed to
-// someone and survive everyone navigating to a new video.
-let myUid = store.get("wp-uid");
-if (!myUid) {
-  myUid = "u" + Math.random().toString(36).slice(2, 10);
-  store.set("wp-uid", myUid);
+// The signed-in Google account (if any). Signing in makes the identity below
+// the same across every device and browser.
+function loadAccount() {
+  try { return JSON.parse(store.get("wp-account") || "null"); } catch { return null; }
 }
+let account = loadAccount();
+
+// A stable per-user id. When signed in it's the Google account id (consistent
+// everywhere); otherwise a random per-browser id. "Who holds the remote" is
+// tracked by this, so control survives everyone navigating to a new video.
+function computeUid() {
+  if (account && account.sub) return "g_" + account.sub;
+  let u = store.get("wp-uid");
+  if (!u) { u = "u" + Math.random().toString(36).slice(2, 10); store.set("wp-uid", u); }
+  return u;
+}
+let myUid = computeUid();
 
 function saveProfile() {
   store.set("wp-profile", JSON.stringify(profile));
@@ -1251,6 +1260,77 @@ function profileChanged() {
   broadcast(profileMsg("hello"));
 }
 
+/* --------------------------------- auth ---------------------------------- */
+
+const identityApi = globalThis.chrome?.identity || globalThis.browser?.identity;
+
+function renderAuthUI() {
+  const signedIn = !!account;
+  $("googleSignIn").hidden = signedIn;
+  $("authHint").hidden = signedIn;
+  $("authSignedIn").hidden = !signedIn;
+  if (signedIn) {
+    $("authName").textContent = account.name || "Signed in";
+    $("authEmail").textContent = account.email || "";
+    if (account.picture) $("authPic").src = account.picture;
+  }
+  // No identity API (standalone/dev http) — hide the whole box.
+  if (!identityApi) $("authBox").hidden = true;
+}
+
+function signInWithGoogle() {
+  if (!identityApi) {
+    setNote("Google sign-in needs the installed extension (not the dev page).");
+    return;
+  }
+  const btn = $("googleSignIn");
+  btn.disabled = true;
+  identityApi.getAuthToken({ interactive: true }, async (token) => {
+    btn.disabled = false;
+    if (globalThis.chrome?.runtime?.lastError || !token) {
+      addSystem("Google sign-in was cancelled or failed.");
+      return;
+    }
+    try {
+      const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: "Bearer " + token },
+      });
+      const info = await res.json();
+      account = {
+        sub: String(info.sub || ""),
+        email: String(info.email || ""),
+        name: String(info.name || info.given_name || ""),
+        picture: String(info.picture || ""),
+        token,
+      };
+      store.set("wp-account", JSON.stringify(account));
+      myUid = computeUid();
+      // Adopt the Google name/photo the first time if the profile is bare.
+      if (!profile.name && account.name) profile.name = account.name.slice(0, 20);
+      saveProfile();
+      renderAuthUI();
+      renderProfileUI();
+      addSystem(`Signed in as ${account.name || account.email}.`);
+      broadcast(profileMsg("hello"));
+    } catch {
+      addSystem("Couldn't read your Google profile — try again.");
+    }
+  });
+}
+
+function signOutGoogle() {
+  const token = account?.token;
+  account = null;
+  store.del("wp-account");
+  myUid = computeUid();
+  renderAuthUI();
+  if (token && identityApi) {
+    try { identityApi.removeCachedAuthToken({ token }, () => {}); } catch {}
+    fetch("https://accounts.google.com/o/oauth2/revoke?token=" + token).catch(() => {});
+  }
+  addSystem("Signed out.");
+}
+
 function buildProfileControls() {
   const colorRow = $("colorRow");
   NAME_COLORS.forEach((c) => {
@@ -1297,6 +1377,8 @@ function buildProfileControls() {
     if (state.view === "profile") showView(state.viewBefore);
     else { renderProfileUI(); showView("profile"); }
   });
+  $("googleSignIn").addEventListener("click", signInWithGoogle);
+  $("googleSignOut").addEventListener("click", signOutGoogle);
 }
 
 /* --------------------------------- controls -------------------------------- */
@@ -1479,6 +1561,7 @@ async function init() {
   }
   wire();
   renderProfileUI();
+  renderAuthUI();
   setStatus("", "Off air");
   // This is the moment the browser asks for camera/mic permission — right when
   // the sidebar opens on Netflix/YouTube/Prime/anywhere.
