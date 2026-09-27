@@ -1346,8 +1346,12 @@ function signInWithGoogle() {
   btn.disabled = true;
   identityApi.getAuthToken({ interactive: true }, async (token) => {
     btn.disabled = false;
-    if (globalThis.chrome?.runtime?.lastError || !token) {
-      addSystem("Google sign-in was cancelled or failed.");
+    const lastErr = globalThis.chrome?.runtime?.lastError;
+    if (lastErr || !token) {
+      const msg = lastErr?.message || "cancelled";
+      addSystem("Google sign-in failed: " + msg);
+      setNote("Sign-in failed: " + msg);
+      console.warn("[watchparty] getAuthToken error:", msg);
       return;
     }
     try {
