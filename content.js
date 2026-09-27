@@ -70,6 +70,15 @@
     return frame;
   }
 
+  const PANEL_W = 340;
+
+  // Zoom <body> so the whole page fits left of the panel. Computed here because
+  // CSS can't derive the factor from the viewport width.
+  function applyZoom() {
+    const f = Math.max(0.4, (window.innerWidth - PANEL_W) / window.innerWidth);
+    document.documentElement.style.setProperty("--wp-zoom", String(f));
+  }
+
   function setOpen(v) {
     isOpen = v;
     if (v) ensureFrame();
@@ -78,13 +87,18 @@
       post({ action: "visibility", open: v });
     }
     btn.classList.toggle("wp-shifted", v);
+    if (v) applyZoom();
     document.documentElement.classList.toggle("watchparty-push", v);
+    if (!v) document.documentElement.style.removeProperty("--wp-zoom");
     // Nudge responsive players (YouTube etc.) to reflow into the new width.
     window.dispatchEvent(new Event("resize"));
     try {
       sessionStorage.setItem("watchparty-open", v ? "1" : "0");
     } catch {}
   }
+
+  // Keep the zoom correct if the window is resized while the panel is open.
+  window.addEventListener("resize", () => { if (isOpen) applyZoom(); });
 
   function post(msg) {
     frame?.contentWindow?.postMessage({ source: "watchparty-host", ...msg }, "*");

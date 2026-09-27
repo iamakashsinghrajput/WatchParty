@@ -1,5 +1,5 @@
-/* The sidebar and its toggle live on <html> so the page-shrink below never
-   moves them. */
+/* The panel and its toggle live on <html> (siblings of <body>), so the page
+   shrink below never moves or scrolls them. */
 #watchparty-frame {
   position: fixed !important;
   top: 0 !important;
@@ -23,26 +23,13 @@
   transform: none;
 }
 
-/* Shrink the page so the sidebar sits BESIDE it, never on top. Transforming
-   <html> makes it the containing block for the page's own position:fixed /
-   100vw players, so full-screen video (Netflix, YouTube, Prime, …) reflows
-   into the remaining width instead of staying full-width behind the panel. */
-html.watchparty-push {
-  width: calc(100% - 340px) !important;
-  min-width: calc(100% - 340px) !important;
-  max-width: calc(100% - 340px) !important;
-  overflow-x: hidden !important;
-  /* Layout containment makes <html> the containing block for the page's
-     position:fixed players (so they reflow into the narrower width) without a
-     transform's compositing cost, and without clipping the panel. */
-  contain: layout !important;
-  transition: width 0.2s ease !important;
-}
-
-/* Once <html> is the containing block, right:-340px drops the panel into the
-   reserved gap beyond the (now narrower) page. */
-html.watchparty-push #watchparty-frame {
-  right: -340px !important;
+/* Shrink the WHOLE page uniformly into the space left of the panel by zooming
+   <body>. Zoom (unlike a transform) also scales the page's own position:fixed
+   players, so full-screen video reflows too — and because we zoom <body>, not
+   <html>, the panel (a child of <html>) stays truly fixed and the page still
+   scrolls normally. The factor is set from JS as --wp-zoom. */
+html.watchparty-push > body {
+  zoom: var(--wp-zoom, 1) !important;
 }
 
 #watchparty-toggle {
@@ -70,8 +57,6 @@ html.watchparty-push #watchparty-frame {
   background: rgba(34, 34, 44, 0.98) !important;
 }
 
-/* When open, the page is narrower and <html>'s right edge already sits at the
-   panel's left edge, so right:0 lands the handle exactly there. */
-html.watchparty-push #watchparty-toggle.wp-shifted {
-  right: 0 !important;
+#watchparty-toggle.wp-shifted {
+  right: 340px !important;
 }

@@ -167,6 +167,14 @@ header {
 }
 
 .note { color: var(--red-soft); font-size: 12px; }
+.note.hint-note {
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 10px;
+  line-height: 1.4;
+}
 
 .field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 500; color: var(--dim); }
 

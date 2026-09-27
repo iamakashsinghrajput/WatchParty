@@ -555,7 +555,17 @@ function setPeerProfile(e, src) {
   }
 }
 
+// A member who leaves and comes back within a few seconds was just navigating
+// to the room's new video — don't spam the feed with left/joined for that.
+const recentlyLeft = new Map(); // uid -> timer
+
 function announce(e) {
+  if (e.uid && recentlyLeft.has(e.uid)) {
+    clearTimeout(recentlyLeft.get(e.uid));
+    recentlyLeft.delete(e.uid);
+    e.announced = true; // they were already in the room; skip the "joined" note
+    return;
+  }
   if (e.announced || e.profile.name === "Guest") return;
   e.announced = true;
   feedEvent(e.profile, "joined the party 🎉");
@@ -571,7 +581,17 @@ function removePeer(pid) {
   try { e.call?.close(); } catch {}
   try { e.audioNode?.disconnect(); } catch {}
   e.tile?.remove();
-  if (e.announced) feedEvent(e.profile, "left the party");
+  // Hold the "left the party" note briefly; if they reconnect (a video change),
+  // announce() cancels it so the reconnect stays silent.
+  if (e.announced && e.uid) {
+    const prof = e.profile;
+    recentlyLeft.set(e.uid, setTimeout(() => {
+      recentlyLeft.delete(e.uid);
+      feedEvent(prof, "left the party");
+    }, 5000));
+  } else if (e.announced) {
+    feedEvent(e.profile, "left the party");
+  }
   // If the person who held the remote just dropped, give them a moment to
   // reconnect (they may be navigating); if they don't come back, the host
   // takes the remote back so the room isn't stuck.
@@ -590,6 +610,9 @@ function removePeer(pid) {
 function refreshStatus() {
   const n = state.peers.size;
   if (n > 0) setStatus("ok", n === 1 ? "Connected" : `Connected · ${n + 1} in room`);
+  // Someone briefly gone (mid video-change) — hold "Connected" instead of
+  // flashing back to the waiting state.
+  else if (recentlyLeft.size > 0) setStatus("ok", "Connected");
   else if (state.role === "host") setStatus("wait", "Waiting for friends…");
   else if (state.room) setStatus("err", "Disconnected");
 }
@@ -1291,16 +1314,24 @@ function updateControls() {
     : state.micOn ? "Mute microphone" : "Unmute microphone";
 }
 
+const NO_VIDEO_HINT = "Tip: open something to watch — whatever you play here plays for everyone in your room.";
+
 function updateLobbyButtons() {
   const hasName = !!$("nameInput").value.trim();
-  // Inside a page, a party needs a video to sync — ask for one first.
-  const hasVideo = !FRAMED || state.pageVideo;
-  $("createBtn").disabled = !(hasName && hasVideo);
-  $("joinBtn").disabled = !(hasName && hasVideo);
+  // Only a name is required now: with the remote following the controller, you
+  // can start a room first and pick the video after. A gentle hint replaces the
+  // old hard block.
+  $("createBtn").disabled = !hasName;
+  $("joinBtn").disabled = !hasName;
   if (state.view === "lobby" && FRAMED) {
-    const gateMsg = "First select a video — open something to watch on this page, then create or join a room.";
-    if (!hasVideo) setNote(gateMsg);
-    else if ($("note").textContent === gateMsg) setNote("");
+    const hasVideo = state.pageVideo;
+    if (!hasVideo && ($("note").hidden || $("note").textContent === NO_VIDEO_HINT)) {
+      $("note").className = "note hint-note";
+      setNote(NO_VIDEO_HINT);
+    } else if (hasVideo && $("note").textContent === NO_VIDEO_HINT) {
+      $("note").className = "note";
+      setNote("");
+    }
   }
 }
 
