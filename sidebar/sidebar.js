@@ -343,21 +343,40 @@ const pick = (a) => a[Math.floor(Math.random() * a.length)];
 const makeCode = () =>
   `${pick(WORDS_A)}-${pick(WORDS_B)}-${1000 + Math.floor(Math.random() * 9000)}`;
 
+// STUN finds a direct path; the free TURN relays are the fallback when a
+// firewall/NAT blocks the direct one — without them a call can spend a long
+// time failing over before media flows, which shows up as "no sound for a few
+// minutes, then fine". Relaying makes the link come up in seconds.
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:443",
+      "turn:openrelay.metered.ca:443?transport=tcp",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+];
+
 function peerOpts() {
+  const base = { config: { iceServers: ICE_SERVERS } };
   const h = params.get("host");
   if (h) {
-    return {
+    return Object.assign(base, {
       host: h,
       port: Number(params.get("port") || 9000),
       path: params.get("path") || "/",
       secure: params.get("secure") === "1",
-    };
+    });
   }
   try {
     const saved = JSON.parse(store.get("wp-server") || "null");
-    if (saved && saved.host) return saved;
+    if (saved && saved.host) return Object.assign(base, saved);
   } catch {}
-  return {};
+  return base;
 }
 
 function newPeer(id) {
@@ -438,7 +457,8 @@ function registerCall(call, outgoing) {
   call.on("stream", (remote) => {
     addTile(e);
     e.video.srcObject = remote;
-    playSafe(e.video);
+    playSafe(e.video);       // muted video (picture only)
+    playRemoteAudio(e, remote); // sound via the unlocked Web Audio graph
   });
   call.on("error", () => {});
 }
@@ -528,6 +548,7 @@ function removePeer(pid) {
   state.peers.delete(pid);
   try { e.conn?.close(); } catch {}
   try { e.call?.close(); } catch {}
+  try { e.audioNode?.disconnect(); } catch {}
   e.tile?.remove();
   if (e.announced) feedEvent(e.profile, "left the party");
   layoutGrid();
@@ -563,6 +584,7 @@ function requireName() {
 
 async function createRoom() {
   if (state.peer || !requireName()) return;
+  primeAudio(); // this click is a user gesture — unlock audio playback now
   await ensureStream();
   state.role = "host";
   startHost(makeCode(), 0, false);
@@ -608,6 +630,7 @@ async function joinRoom(codeRaw, rejoinAttempt) {
   if (state.peer || !requireName()) return;
   const code = String(codeRaw || "").trim().toLowerCase();
   if (!code) return;
+  if (!rejoinAttempt) primeAudio(); // Join click is a gesture — unlock audio
   await ensureStream();
   state.role = "guest";
   setStatus("wait", rejoinAttempt ? "Reconnecting…" : "Joining room…");
@@ -934,18 +957,49 @@ function enableChat(on) {
   if (on && state.view === "room") $("chatInput").focus();
 }
 
+// Remote audio. Browsers block un-muted <video> autoplay until a gesture in
+// THAT document — and on a streaming site the user's clicks land on the movie,
+// not on our sidebar iframe, so the tile's own audio could stay muted for a
+// long time. Instead we route each remote stream's audio through a Web Audio
+// graph that we unlock on the create/join click; the tile <video> stays muted
+// (it only shows the picture). This is the reliable way to get sound the
+// instant a peer connects. (A muted playing <video> is also kept because Chrome
+// won't emit a remote stream's audio through Web Audio without one.)
+let sharedAudioCtx = null;
+
+function audioCtx() {
+  if (!sharedAudioCtx) {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      sharedAudioCtx = new Ctx();
+    } catch {}
+  }
+  return sharedAudioCtx;
+}
+
+function primeAudio() {
+  audioCtx()?.resume?.().catch(() => {});
+}
+
+function resumeAudio() {
+  audioCtx()?.resume?.().catch(() => {});
+}
+
+function playRemoteAudio(e, stream) {
+  const ctx = audioCtx();
+  if (!ctx || !stream.getAudioTracks().length) return;
+  try {
+    if (e.audioNode) { try { e.audioNode.disconnect(); } catch {} }
+    e.audioNode = ctx.createMediaStreamSource(stream);
+    e.audioNode.connect(ctx.destination);
+  } catch {}
+  ctx.resume().catch(() => {});
+}
+
 function playSafe(v) {
+  v.muted = true; // audio flows through Web Audio, not the element
   const p = v.play();
-  if (p?.catch) p.catch(() => {
-    // Autoplay with sound was blocked — start muted so video shows, then
-    // restore sound on the user's next click anywhere in the panel.
-    v.muted = true;
-    v.play().catch(() => {});
-    document.addEventListener("click", () => {
-      v.muted = false;
-      v.play().catch(() => {});
-    }, { once: true });
-  });
+  if (p?.catch) p.catch(() => { v.play().catch(() => {}); });
 }
 
 function addTile(e) {
@@ -1286,6 +1340,12 @@ function wire() {
   window.addEventListener("beforeunload", () => {
     broadcast({ type: "bye" });
   });
+
+  // Any user interaction resumes the audio graph (autoplay policy may suspend
+  // it). Capture phase so nothing can swallow it first.
+  ["click", "keydown", "pointerdown", "touchstart"].forEach((ev) =>
+    document.addEventListener(ev, resumeAudio, true)
+  );
 }
 
 async function init() {
