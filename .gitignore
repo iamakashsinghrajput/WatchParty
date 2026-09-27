@@ -8,3 +8,5 @@ test/embed-top.html
 test/embed-blank.html
 test/embed-outer-same.html
 test/scrollable.html
+backend/node_modules/
+backend/.env

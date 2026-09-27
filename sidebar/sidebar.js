@@ -21,6 +21,13 @@ const store = {
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
 
+// Profile-sync backend (Railway). Paste your deployed URL here once it's live,
+// e.g. "https://watchparty-backend-production.up.railway.app". Left empty, the
+// extension works fully but keeps the profile on this device only. Can also be
+// overridden at runtime via localStorage "wp-backend".
+const DEFAULT_BACKEND_URL = "";
+const BACKEND_URL = (store.get("wp-backend") || DEFAULT_BACKEND_URL).replace(/\/+$/, "");
+
 /* --------------------------------- profile --------------------------------- */
 
 const AVATARS = ["🍿", "🎬", "🎧", "🌙", "⭐", "🔥", "🐯", "🐼", "🦊", "🐸", "🐙", "🦄", "🍕", "🍩", "⚡", "🎮"];
@@ -1264,11 +1271,53 @@ function profileChanged() {
   saveProfile();
   renderProfileUI();
   broadcast(profileMsg("hello"));
+  pushProfileToBackend(); // sync the change to the user's account
 }
 
 /* --------------------------------- auth ---------------------------------- */
 
 const identityApi = globalThis.chrome?.identity || globalThis.browser?.identity;
+
+// Talk to the profile-sync backend with the Google token, if one is configured.
+async function backendFetch(path, options = {}) {
+  if (!BACKEND_URL || !account?.token) return null;
+  try {
+    const res = await fetch(BACKEND_URL + path, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + account.token,
+        ...(options.headers || {}),
+      },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// Apply a profile that came back from the backend onto the local one.
+function applyServerProfile(p) {
+  if (!p) return;
+  if (typeof p.name === "string" && p.name) profile.name = p.name.slice(0, 20);
+  if (AVATARS.includes(p.avatar)) profile.avatar = p.avatar;
+  if (NAME_COLORS.includes(p.color)) profile.color = p.color;
+  if (BADGES.includes(p.badge)) profile.badge = p.badge;
+  saveProfile();
+  renderProfileUI();
+}
+
+// Push the current profile to the backend (debounced by the caller).
+function pushProfileToBackend() {
+  if (!BACKEND_URL || !account) return;
+  backendFetch("/profile", {
+    method: "PUT",
+    body: JSON.stringify({
+      name: profile.name, avatar: profile.avatar, color: profile.color, badge: profile.badge,
+    }),
+  });
+}
 
 function renderAuthUI() {
   const signedIn = !!account;
@@ -1321,6 +1370,9 @@ function signInWithGoogle() {
       renderAuthUI();
       renderProfileUI();
       addSystem(`Signed in as ${account.name || account.email}.`);
+      // Pull this user's saved profile from the backend (syncs across devices).
+      const server = await backendFetch("/auth", { method: "POST" });
+      if (server) { applyServerProfile(server); renderAuthUI(); }
       broadcast(profileMsg("hello"));
     } catch {
       addSystem("Couldn't read your Google profile — try again.");
@@ -1573,6 +1625,11 @@ async function init() {
   renderProfileUI();
   renderAuthUI();
   setStatus("", "Off air");
+  // If signed in, pull the latest profile from the account so edits made on
+  // another device show up here.
+  if (account && BACKEND_URL) {
+    backendFetch("/profile").then((p) => { if (p) { applyServerProfile(p); renderAuthUI(); } });
+  }
   // This is the moment the browser asks for camera/mic permission — right when
   // the sidebar opens on Netflix/YouTube/Prime/anywhere.
   await ensureStream();
