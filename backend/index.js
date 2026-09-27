@@ -36,23 +36,36 @@ const GOOGLE_CLIENT_IDS = (
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!MONGODB_URI) {
-  console.error("MONGODB_URI environment variable is required.");
-  process.exit(1);
-}
-
 const app = express();
 app.use(cors()); // extension pages fetch cross-origin; allow it
 app.use(express.json({ limit: "16kb" }));
 
-const client = new MongoClient(MONGODB_URI);
-let users;
+let users = null;
+let dbError = "";
 
 async function init() {
-  await client.connect();
-  users = client.db(DB_NAME).collection("users");
-  await users.createIndex({ email: 1 });
-  console.log("Connected to MongoDB (db:", DB_NAME + ")");
+  if (!MONGODB_URI) { dbError = "MONGODB_URI is not set"; console.error(dbError); return; }
+  try {
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    await client.connect();
+    await client.db(DB_NAME).command({ ping: 1 });
+    users = client.db(DB_NAME).collection("users");
+    await users.createIndex({ email: 1 });
+    dbError = "";
+    console.log("Connected to MongoDB (db:", DB_NAME + ")");
+  } catch (e) {
+    dbError = String(e && e.message || e);
+    // Common cause: Atlas Network Access hasn't allowed 0.0.0.0/0 for Railway.
+    console.error("MongoDB connection FAILED:", dbError);
+    console.error("If this is a timeout, allow 0.0.0.0/0 in Atlas → Network Access.");
+    setTimeout(init, 10000); // keep retrying so it recovers once Atlas is opened
+  }
+}
+
+// Endpoints that need the DB return 503 until it's connected.
+function requireDb(res) {
+  if (!users) { res.status(503).json({ error: "database not ready", detail: dbError }); return false; }
+  return true;
 }
 
 // Validate the Google access token and return the caller's identity, or null.
@@ -96,11 +109,12 @@ const publicProfile = (u) => ({
   badge: u.badge || "",
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => res.json({ ok: true, db: !!users, dbError: dbError || undefined }));
 
 // Sign in: upsert the user and return their stored profile (created on first
 // sign-in from their Google name).
 app.post("/auth", async (req, res) => {
+  if (!requireDb(res)) return;
   const g = await verify(req);
   if (!g) return res.status(401).json({ error: "unauthorized" });
   const now = new Date();
@@ -125,6 +139,7 @@ app.post("/auth", async (req, res) => {
 
 // Read the signed-in user's profile.
 app.get("/profile", async (req, res) => {
+  if (!requireDb(res)) return;
   const g = await verify(req);
   if (!g) return res.status(401).json({ error: "unauthorized" });
   const u = await users.findOne({ _id: g.sub });
@@ -133,6 +148,7 @@ app.get("/profile", async (req, res) => {
 
 // Update the signed-in user's profile.
 app.put("/profile", async (req, res) => {
+  if (!requireDb(res)) return;
   const g = await verify(req);
   if (!g) return res.status(401).json({ error: "unauthorized" });
   const b = req.body || {};
@@ -150,9 +166,9 @@ app.put("/profile", async (req, res) => {
   res.json(publicProfile(u));
 });
 
-init()
-  .then(() => app.listen(PORT, () => console.log("WatchParty backend listening on " + PORT)))
-  .catch((err) => {
-    console.error("Startup failed:", err);
-    process.exit(1);
-  });
+// Start the web server FIRST so Railway's health check passes even while the
+// DB is still connecting; then connect to Mongo (with retries) in the
+// background. This turns a DB outage into a 503 on data routes instead of a
+// dead service that never boots.
+app.listen(PORT, () => console.log("WatchParty backend listening on " + PORT));
+init();
