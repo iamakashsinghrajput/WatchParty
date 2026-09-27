@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WatchParty — Watch Together",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "description": "Watch together from anywhere: camera and chat beside the video, rooms for up to six friends, reactions and playback sync.",
   "permissions": ["activeTab", "scripting", "identity"],
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzIyPBD0Vpw6SPePn5RVDv3C4fvI4ARLuVWsALSU+rIXRJozzOdxuKFPvvXwxSI/ElgDKyRxNJJe/wI0H7gmzqUBi502fdrJrrfMFQSHnlFSHX+ybPE2Pjz6AWCdKVw/MNmHDjv/pjY1znijt5PxjmlU6urbBiVa/bUPi4+kHHHy/I4rWhLqfVlqllKuuVpSXi6o1hvKQQR6yNfKe7ZSLIWDP4Zz7iW9cdjH9bsYuz4RB7bolSMhyz5LOn3IjyrRIvycrnI/viuBxBPqeOb7TdX8K/Nppzd0rorPCA/J+rPwTC6iANo6ru9JX1uEd4hdbriOyg/uQNq5lyY8zSTxetQIDAQAB",

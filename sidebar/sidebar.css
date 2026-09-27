@@ -309,6 +309,17 @@ select { appearance: none; -webkit-appearance: none; cursor: pointer; }
 
 /* ------------------------------- auth ------------------------------- */
 
+.lobby-auth {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+}
+.lobby-auth-title { font-weight: 700; font-size: 14px; }
+
 .auth-box { display: flex; flex-direction: column; gap: 8px; }
 .google-btn {
   display: flex;

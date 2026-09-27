@@ -633,6 +633,12 @@ function broadcast(obj) {
 }
 
 function requireName() {
+  // Creating or joining a room requires a signed-in account.
+  if (!account) {
+    setNote("Sign in with Google to create or join a room.");
+    renderAuthUI();
+    return false;
+  }
   const v = $("nameInput").value.trim();
   if (v) profile.name = v.slice(0, 20);
   if (!profile.name) {
@@ -1266,6 +1272,7 @@ const identityApi = globalThis.chrome?.identity || globalThis.browser?.identity;
 
 function renderAuthUI() {
   const signedIn = !!account;
+  // Profile screen auth box
   $("googleSignIn").hidden = signedIn;
   $("authHint").hidden = signedIn;
   $("authSignedIn").hidden = !signedIn;
@@ -1274,8 +1281,11 @@ function renderAuthUI() {
     $("authEmail").textContent = account.email || "";
     if (account.picture) $("authPic").src = account.picture;
   }
-  // No identity API (standalone/dev http) — hide the whole box.
-  if (!identityApi) $("authBox").hidden = true;
+  $("authBox").hidden = !identityApi; // no identity API on the dev http page
+  // Lobby gate: creating/joining a room requires signing in.
+  $("lobbyAuth").hidden = signedIn;
+  $("lobbyControls").hidden = !signedIn;
+  updateLobbyButtons();
 }
 
 function signInWithGoogle() {
@@ -1378,6 +1388,7 @@ function buildProfileControls() {
     else { renderProfileUI(); showView("profile"); }
   });
   $("googleSignIn").addEventListener("click", signInWithGoogle);
+  $("lobbySignIn").addEventListener("click", signInWithGoogle);
   $("googleSignOut").addEventListener("click", signOutGoogle);
 }
 
@@ -1400,11 +1411,10 @@ const NO_VIDEO_HINT = "Tip: open something to watch — whatever you play here p
 
 function updateLobbyButtons() {
   const hasName = !!$("nameInput").value.trim();
-  // Only a name is required now: with the remote following the controller, you
-  // can start a room first and pick the video after. A gentle hint replaces the
-  // old hard block.
-  $("createBtn").disabled = !hasName;
-  $("joinBtn").disabled = !hasName;
+  // Must be signed in to create or join a room, and have a name.
+  const ready = hasName && !!account;
+  $("createBtn").disabled = !ready;
+  $("joinBtn").disabled = !ready;
   if (state.view === "lobby" && FRAMED) {
     const hasVideo = state.pageVideo;
     if (!hasVideo && ($("note").hidden || $("note").textContent === NO_VIDEO_HINT)) {
