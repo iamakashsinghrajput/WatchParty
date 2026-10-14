@@ -23,13 +23,18 @@
   transform: none;
 }
 
-/* Shrink the WHOLE page uniformly into the space left of the panel by zooming
-   <body>. Zoom (unlike a transform) also scales the page's own position:fixed
-   players, so full-screen video reflows too — and because we zoom <body>, not
-   <html>, the panel (a child of <html>) stays truly fixed and the page still
-   scrolls normally. The factor is set from JS as --wp-zoom. */
-html.watchparty-push > body {
-  zoom: var(--wp-zoom, 1) !important;
+/* Make room for the panel by narrowing the page's WIDTH only — the height
+   stays the full viewport, so a full-screen player keeps its full height
+   instead of shrinking into a box with a dead band beneath it. Normal page
+   content reflows into the narrower <html>; the page's own position:fixed
+   players and bars ignore that width, so content.js fits those individually
+   (right edge pinned to the panel). No containment/transform/zoom here, so the
+   page scrolls normally and the panel stays truly fixed. */
+html.watchparty-push {
+  width: calc(100% - 340px) !important;
+  min-width: 0 !important;
+  max-width: calc(100% - 340px) !important;
+  overflow-x: hidden !important;
 }
 
 #watchparty-toggle {

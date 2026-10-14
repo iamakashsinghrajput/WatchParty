@@ -17,6 +17,25 @@
 
   const area = (v) => (v ? v.offsetWidth * v.offsetHeight : 0);
 
+  // Ads usually play in the SAME <video> element as the show (YouTube, Prime,
+  // Hotstar…), so while one is running its play/pause/time must not leak into
+  // the room, and sync commands must not seek the ad. Detected by the player's
+  // own ad markers.
+  const AD_SELECTORS = [
+    ".ad-showing", ".ad-interrupting",                 // YouTube player states
+    ".ytp-ad-player-overlay", ".ytp-ad-preview-container",
+    ".atvwebplayersdk-ad-timer", ".atvwebplayersdk-adtimeindicator-text", // Prime Video
+  ].join(",");
+
+  function inAd(v) {
+    if (!v) return false;
+    // YouTube marks the player wrapping the video; check its ancestors first.
+    if (v.closest(".ad-showing, .ad-interrupting")) return true;
+    const el = document.querySelector(AD_SELECTORS);
+    return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  }
+  let adOn = false;
+
   function bestVideo() {
     const vids = [...document.querySelectorAll("video")].filter(
       (v) => v.offsetWidth > 8 && v.offsetHeight > 8
@@ -30,7 +49,7 @@
   }
 
   function report(kind) {
-    if (!video || Date.now() < suppressUntil) return;
+    if (!video || Date.now() < suppressUntil || adOn || inAd(video)) return;
     toTop({ t: "event", kind, time: video.currentTime || 0, area: area(video) });
   }
   const onPlay = () => report("play");
@@ -55,8 +74,16 @@
   function sendState() {
     const v = bestVideo();
     bind(v);
-    toTop({ t: "state", has: !!v, paused: v ? v.paused : true, time: v ? v.currentTime : 0, area: area(v) });
+    adOn = inAd(v);
+    toTop({ t: "state", has: !!v, paused: v ? v.paused : true, time: v ? v.currentTime : 0, area: area(v), ad: adOn });
   }
+
+  // Watch for ads starting/ending quickly — a 3s state poll is too slow.
+  setInterval(() => {
+    if (!video) return;
+    const now = inAd(video);
+    if (now !== adOn) sendState();
+  }, 500);
 
   function forward(msg) {
     for (let i = 0; i < window.frames.length; i++) {
@@ -67,13 +94,18 @@
   function apply(cmd, time) {
     const v = bestVideo();
     bind(v);
-    if (v) {
+    // Never drive an ad: the room is holding for it and re-syncs afterwards.
+    if (v && !inAd(v)) {
       suppressUntil = Date.now() + 1500;
       if (cmd === "play") {
-        if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) {
+        // play() on a finished video restarts it from 0 — start it first, then
+        // place it, so the seek below wins.
+        const ended = v.ended;
+        if (ended) v.play().catch(() => {});
+        if (typeof time === "number" && (ended || Math.abs(v.currentTime - time) > 1.5)) {
           try { v.currentTime = time; } catch {}
         }
-        v.play().catch(() => {});
+        if (!ended) v.play().catch(() => {});
       } else if (cmd === "pause") {
         v.pause();
         if (typeof time === "number" && Math.abs(v.currentTime - time) > 1.5) {

@@ -22,6 +22,10 @@
 
   let frame = null;
   let isOpen = false;
+  // Chrome/Brave side panel available: the browser shrinks the whole page for
+  // us and the panel survives navigations. The in-page frame is the fallback.
+  let panelMode = false;
+  let panelLinked = false; // the side panel has talked to this page
 
   const btn = document.createElement("button");
   btn.id = "watchparty-toggle";
@@ -32,7 +36,12 @@
     '<path fill="#fff" d="M10 7.4v6.2a.8.8 0 0 0 1.2.68l5.3-3.1a.8.8 0 0 0 0-1.37l-5.3-3.1a.8.8 0 0 0-1.2.69Z"/></svg>';
   btn.title = "WatchParty — watch together with camera & chat";
   btn.setAttribute("aria-label", "Toggle WatchParty sidebar");
-  btn.addEventListener("click", () => setOpen(!isOpen));
+  btn.addEventListener("click", () => {
+    if (!panelMode) return setOpen(!isOpen);
+    api.runtime.sendMessage({ source: "watchparty", action: "open-panel" })
+      .then((r) => { if (!r || !r.ok) setOpen(!isOpen); })
+      .catch(() => setOpen(!isOpen));
+  });
 
   /* --------------------------- one-shot rejoin --------------------------- */
   // Set ONLY when auto-opening the host's video (content sync), and consumed
@@ -72,12 +81,64 @@
 
   const PANEL_W = 340;
 
-  // Zoom <body> so the whole page fits left of the panel. Computed here because
-  // CSS can't derive the factor from the viewport width.
-  function applyZoom() {
-    const f = Math.max(0.4, (window.innerWidth - PANEL_W) / window.innerWidth);
-    document.documentElement.style.setProperty("--wp-zoom", String(f));
+  // Full-width position:fixed elements (Netflix/Prime/Hotstar players, YouTube's
+  // masthead, …) are sized against the viewport, not <html>, so the CSS width
+  // cut misses them. Pin each one's right edge to the panel. Only ancestors of
+  // <video>s and shallow page chrome are checked, so this stays cheap on huge
+  // DOMs. Original inline values are kept so closing restores them exactly.
+  const FIT_PROPS = ["left", "right", "width", "max-width", "min-width"];
+  const fitted = new Map(); // el -> {prop: [value, priority]}
+
+  function fitCandidates() {
+    const set = new Set();
+    for (const v of document.querySelectorAll("video")) {
+      for (let el = v; el && el !== document.body && el !== document.documentElement; el = el.parentElement) set.add(el);
+    }
+    if (document.body) {
+      for (const el of document.body.querySelectorAll(":scope > *, :scope > * > *, :scope > * > * > *")) set.add(el);
+    }
+    return set;
   }
+
+  function fitFixed() {
+    if (!isOpen) return;
+    const vw = window.innerWidth;
+    for (const el of fitted.keys()) if (!el.isConnected) fitted.delete(el);
+    for (const el of fitCandidates()) {
+      if (el === frame || el === btn || fitted.has(el)) continue;
+      if (getComputedStyle(el).position !== "fixed") continue;
+      const r = el.getBoundingClientRect();
+      // Wide, anchored at the left edge, and running under the panel.
+      if (r.left > 1 || r.width < vw * 0.5 || r.right <= vw - PANEL_W + 1) continue;
+      const orig = {};
+      for (const p of FIT_PROPS) orig[p] = [el.style.getPropertyValue(p), el.style.getPropertyPriority(p)];
+      fitted.set(el, orig);
+      el.style.setProperty("left", "0px", "important");
+      el.style.setProperty("right", PANEL_W + "px", "important");
+      el.style.setProperty("width", "auto", "important");
+      el.style.setProperty("min-width", "0px", "important");
+      el.style.setProperty("max-width", `calc(100vw - ${PANEL_W}px)`, "important");
+    }
+  }
+
+  function unfitFixed() {
+    for (const [el, orig] of fitted) {
+      for (const p of FIT_PROPS) {
+        const [val, prio] = orig[p];
+        if (val) el.style.setProperty(p, val, prio);
+        else el.style.removeProperty(p);
+      }
+    }
+    fitted.clear();
+  }
+
+  // Players are built (and rebuilt) dynamically — refit as the DOM changes.
+  let fitTimer = 0;
+  const scheduleFit = () => {
+    if (!isOpen || fitTimer) return;
+    fitTimer = setTimeout(() => { fitTimer = 0; fitFixed(); }, 300);
+  };
+  const fitObserver = new MutationObserver(scheduleFit);
 
   function setOpen(v) {
     isOpen = v;
@@ -87,9 +148,14 @@
       post({ action: "visibility", open: v });
     }
     btn.classList.toggle("wp-shifted", v);
-    if (v) applyZoom();
     document.documentElement.classList.toggle("watchparty-push", v);
-    if (!v) document.documentElement.style.removeProperty("--wp-zoom");
+    if (v) {
+      fitFixed();
+      fitObserver.observe(document.documentElement, { childList: true, subtree: true });
+    } else {
+      fitObserver.disconnect();
+      unfitFixed();
+    }
     // Nudge responsive players (YouTube etc.) to reflow into the new width.
     window.dispatchEvent(new Event("resize"));
     try {
@@ -97,11 +163,16 @@
     } catch {}
   }
 
-  // Keep the zoom correct if the window is resized while the panel is open.
-  window.addEventListener("resize", () => { if (isOpen) applyZoom(); });
+  // Elements that become full-width on resize (e.g. a window going wide) need
+  // fitting too. Already-fitted ones use viewport-relative values, so they
+  // follow resizes on their own.
+  window.addEventListener("resize", scheduleFit);
 
   function post(msg) {
     frame?.contentWindow?.postMessage({ source: "watchparty-host", ...msg }, "*");
+    if (panelLinked) {
+      try { api.runtime.sendMessage({ source: "watchparty-host", ...msg }).catch(() => {}); } catch {}
+    }
   }
 
   function injectBridge() {
@@ -135,6 +206,7 @@
       available: !!a,
       paused: a ? a.paused : true,
       time: a ? a.time : 0,
+      ad: a ? !!a.ad : false,
       // Content sync always navigates to the TOP page URL, not an embed's URL.
       href: location.href,
     });
@@ -163,9 +235,13 @@
 
   /* -------------------------------- messaging -------------------------------- */
 
-  api.runtime?.onMessage?.addListener((msg) => {
-    if (msg && msg.source === "watchparty" && msg.action === "toggle") {
-      setOpen(!isOpen);
+  api.runtime?.onMessage?.addListener((msg, _sender, sendResponse) => {
+    if (!msg || msg.source !== "watchparty") return;
+    if (msg.action === "toggle") setOpen(!isOpen);
+    else if (msg.action === "ping") sendResponse(true);
+    else if (msg.viaPanel) {
+      panelLinked = true;
+      onSidebarMessage(msg, true);
     }
   });
 
@@ -178,7 +254,7 @@
       if (d.t === "state") {
         frames.set(e.source, {
           has: !!d.has, paused: !!d.paused, time: Number(d.time) || 0,
-          area: Number(d.area) || 0, at: Date.now(),
+          area: Number(d.area) || 0, ad: !!d.ad, at: Date.now(),
         });
         relayState();
       } else if (d.t === "event") {
@@ -199,8 +275,15 @@
 
     // Messages from the sidebar iframe.
     if (d.source !== "watchparty") return;
-    if (frame && e.source !== frame.contentWindow) return;
+    if (!frame || e.source !== frame.contentWindow) return;
+    onSidebarMessage(d, false);
+  });
+
+  // Commands from the sidebar — the in-page frame or the browser side panel.
+  // The panel outlives navigations, so it needs no rejoin handoff.
+  function onSidebarMessage(d, viaPanel) {
     if (d.action === "close") {
+      if (viaPanel) return;
       setOpen(false);
     } else if (d.action === "video-query") {
       broadcastQuery();
@@ -208,6 +291,7 @@
     } else if (d.action === "video-control") {
       applyControl(String(d.cmd || ""), d.time);
     } else if (d.action === "persist-rejoin") {
+      if (viaPanel) return;
       // Keep a one-shot rejoin ready so this room survives a navigation.
       try {
         sessionStorage.setItem("watchparty-rejoin", JSON.stringify({
@@ -219,6 +303,7 @@
     } else if (d.action === "navigate") {
       const url = String(d.url || "");
       if (url && url !== location.href) {
+        if (viaPanel) { location.assign(url); return; }
         // One-shot handoff so the sidebar rejoins this room after the reload.
         try {
           sessionStorage.setItem("watchparty-rejoin", JSON.stringify({
@@ -233,7 +318,7 @@
     } else if (d.action === "clear-session") {
       clearRejoin();
     }
-  });
+  }
 
   let saved = null;
   try {
@@ -242,12 +327,23 @@
   const autoOpen = AUTO_OPEN_HOSTS.test(location.hostname) || isAmazonVideo;
   const rejoining = !!readRejoin();
 
-  const start = () => {
-    // Attach to <html>, not <body>: the page-shrink transform is on <html>, so
-    // a child of <html> stays put while the page (in <body>) reflows.
+  const start = async () => {
+    // Attach to <html>, not <body>, so the page's own layout never moves it.
     document.documentElement.appendChild(btn);
-    // Open on load only to finish a content-sync handoff, to restore an
-    // explicitly-opened panel, or on the streaming sites that auto-open.
+    try {
+      const r = await api.runtime.sendMessage({ source: "watchparty", action: "panel-supported" });
+      panelMode = !!(r && r.ok);
+    } catch {}
+    if (panelMode) {
+      // Tell an already-open side panel this page (re)loaded, so it re-reads
+      // the video right away — e.g. after following the host to a new video.
+      panelLinked = true;
+      broadcastQuery();
+      post({ action: "page-ready", href: location.href });
+      return;
+    }
+    // In-page frame: open on load only to finish a content-sync handoff, to
+    // restore an explicitly-opened panel, or on the streaming sites that auto-open.
     if (rejoining || saved === "1" || (autoOpen && saved !== "0")) setOpen(true);
   };
   if (document.readyState === "loading") {

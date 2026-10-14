@@ -167,6 +167,16 @@ header {
 }
 
 .note { color: var(--red-soft); font-size: 12px; }
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--slate);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
 .note.hint-note {
   color: var(--dim);
   background: var(--panel);
@@ -224,8 +234,71 @@ select { appearance: none; -webkit-appearance: none; cursor: pointer; }
 .divider { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 11.5px; }
 .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 
-.join-row { display: flex; gap: 8px; }
-.join-row input { flex: 1; min-width: 0; }
+#lobbyControls { display: flex; flex-direction: column; gap: 13px; }
+
+/* Room cards: your own fixed code, and the four boxes for a friend's. Codes
+   are information, so they wear slate; the action that starts a room is red. */
+.room-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.my-room {
+  background: linear-gradient(180deg, var(--slate-tint), var(--panel) 70%);
+  border-color: var(--slate-line);
+}
+.room-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.room-card-head .mini { height: 24px; padding: 0 8px; font-size: 11.5px; }
+.eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.room-card .hint { line-height: 1.4; }
+.btn.block { width: 100%; padding: 10px 13px; }
+
+.code-tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.code-tiles > * {
+  height: 52px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  font: 600 26px/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+#myCode > span {
+  color: var(--slate);
+  background: var(--bg2);
+  border: 1px solid var(--slate-line);
+}
+
+.join-line { display: flex; gap: 8px; align-items: stretch; }
+.code-inputs { flex: 1; min-width: 0; gap: 6px; }
+.code-inputs input {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  text-align: center;
+  font-size: 22px;
+  height: 48px;
+  background: var(--bg2);
+  caret-color: var(--red);
+}
+.code-inputs input::placeholder { color: var(--line-2); }
+.code-inputs input:not(:placeholder-shown):not(:focus) { border-color: var(--line-2); background: var(--panel-2); }
+.join-btn { height: 48px; padding: 0 16px; }
+.join-btn:not(:disabled) {
+  border-color: var(--slate-line);
+  background: var(--slate-tint);
+  color: var(--slate);
+}
+.join-btn:not(:disabled):hover { background: #1e2536; }
 
 .hint { color: var(--dim); font-size: 12px; }
 .hint.center { text-align: center; }
@@ -432,7 +505,8 @@ select { appearance: none; -webkit-appearance: none; cursor: pointer; }
 }
 
 #roomCode {
-  font: 600 12px ui-monospace, Menlo, Consolas, monospace;
+  font: 600 13px ui-monospace, Menlo, Consolas, monospace;
+  letter-spacing: 0.18em;
   color: var(--slate);
   background: var(--slate-tint);
   border: 1px solid var(--slate-line);
@@ -443,6 +517,29 @@ select { appearance: none; -webkit-appearance: none; cursor: pointer; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.hold-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: #f3d79a;
+  background: #2a2312;
+  border-bottom: 1px solid #4d3f1c;
+  flex: none;
+}
+.hold-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f0b94a;
+  flex: none;
+  animation: hold-pulse 1.4s ease-in-out infinite;
+}
+@keyframes hold-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .hold-dot { animation: none; } }
 
 .mini {
   display: inline-flex;

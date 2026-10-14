@@ -10,3 +10,6 @@ test/embed-outer-same.html
 test/scrollable.html
 backend/node_modules/
 backend/.env
+
+# packaged builds (./package.sh)
+watchparty-v*/

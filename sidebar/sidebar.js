@@ -13,6 +13,25 @@ const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const FAKE = params.get("fake") === "1";
 const FRAMED = window.parent !== window;
+// Chrome/Brave side panel: the browser itself shrinks the page beside us, and
+// the panel survives page navigations (so the call never drops on a video
+// change). Talks to the page in the window's active tab via extension messaging.
+const ext = globalThis.chrome?.runtime?.id ? globalThis.chrome : null;
+const PANEL = !FRAMED && !window.opener && !!ext?.sidePanel && location.protocol.endsWith("-extension:");
+// There is a page (with a video) under us to sync with.
+const HOSTED = FRAMED || PANEL;
+let hostTabId = null; // PANEL: the tab we're syncing with
+
+// Send a message to the page's content script, whichever way we're attached.
+function hostPost(msg) {
+  const m = Object.assign({ source: "watchparty" }, msg);
+  if (FRAMED) {
+    parent.postMessage(m, "*");
+  } else if (PANEL && hostTabId != null) {
+    m.viaPanel = true;
+    ext.tabs.sendMessage(hostTabId, m).catch(() => {});
+  }
+}
 const MAX_PARTICIPANTS = 6; // mesh video stays usable up to ~6 people
 
 const store = {
@@ -25,7 +44,7 @@ const store = {
 // e.g. "https://watchparty-backend-production.up.railway.app". Left empty, the
 // extension works fully but keeps the profile on this device only. Can also be
 // overridden at runtime via localStorage "wp-backend".
-const DEFAULT_BACKEND_URL = "";
+const DEFAULT_BACKEND_URL = "https://watchparty-production-8b70.up.railway.app";
 const BACKEND_URL = (store.get("wp-backend") || DEFAULT_BACKEND_URL).replace(/\/+$/, "");
 
 /* --------------------------------- profile --------------------------------- */
@@ -109,6 +128,10 @@ const state = {
   lastSharedUrl: "",    // the last video URL I broadcast (while controller)
   lastRoomUrl: "",      // the room's current video URL (for newcomers)
   navigating: false,    // currently opening the controller's video
+  leaving: false,       // Leave pressed — don't try to reconnect
+  myAd: false,          // my player is showing an ad right now
+  adHolds: new Map(),   // uid -> {name, since}: members currently in an ad
+  holdResume: false,    // the room was playing when the ad hold began
   view: "lobby",        // "lobby" | "room" | "profile"
   viewBefore: "lobby",
 };
@@ -169,6 +192,43 @@ function cameraNote(err) {
   return "Camera unavailable — showing an avatar instead.";
 }
 
+// The browser's side panel can't show the camera/mic permission prompt. Offer
+// a one-time grant tab (same extension origin, so the grant carries over), and
+// switch the real camera/mic in as soon as it's allowed.
+let grantOffered = false;
+async function offerPanelGrant(err) {
+  if (grantOffered || err?.name !== "NotAllowedError") return;
+  let perm = null;
+  try { perm = await navigator.permissions.query({ name: "camera" }); } catch {}
+  if (perm && perm.state === "denied") return; // the user said no — respect it
+  grantOffered = true;
+  const note = $("note");
+  note.textContent = "Allow your camera & mic once so friends can see and hear you. ";
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "link-btn";
+  b.textContent = "Allow camera & mic";
+  b.addEventListener("click", () => ext.tabs.create({ url: ext.runtime.getURL("sidebar/grant.html") }));
+  note.appendChild(b);
+  note.hidden = false;
+  if (perm) {
+    perm.onchange = async () => {
+      if (perm.state !== "granted") return;
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(), audio: audioConstraints() });
+        replaceTrackEverywhere("video", s.getVideoTracks()[0]);
+        replaceTrackEverywhere("audio", s.getAudioTracks()[0]);
+        state.videoIsFake = false;
+        state.audioIsFake = false;
+        state.camOn = true;
+        state.micOn = true;
+        updateControls();
+        setNote("");
+      } catch {}
+    };
+  }
+}
+
 function savedDevices() {
   try { return JSON.parse(store.get("wp-devices") || "null") || {}; } catch { return {}; }
 }
@@ -205,7 +265,7 @@ async function ensureStream() {
       try {
         const sv = await navigator.mediaDevices.getUserMedia({ video: videoConstraints() });
         vTrack = sv.getVideoTracks()[0] || null;
-      } catch (e2) { setNote(cameraNote(e2)); }
+      } catch (e2) { setNote(cameraNote(e2)); if (PANEL) offerPanelGrant(e2); }
       try {
         const sa = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
         aTrack = sa.getAudioTracks()[0] || null;
@@ -363,11 +423,22 @@ async function saveSetup() {
 
 /* ---------------------------------- rooms ---------------------------------- */
 
-const WORDS_A = ["sunny", "cosmic", "mellow", "ruby", "lucky", "velvet", "neon", "polar", "magic", "turbo"];
-const WORDS_B = ["tiger", "panda", "otter", "falcon", "comet", "llama", "mango", "pixel", "nova", "koala"];
-const pick = (a) => a[Math.floor(Math.random() * a.length)];
-const makeCode = () =>
-  `${pick(WORDS_A)}-${pick(WORDS_B)}-${1000 + Math.floor(Math.random() * 9000)}`;
+// Every user owns one fixed 4-digit room code, derived from their account id
+// so it's the same on every device — friends can reuse it every time. The
+// signaling id is namespaced so a bare "4821" never collides with other apps
+// sharing the PeerJS cloud.
+const ROOM_PEER_PREFIX = "watchparty-room-";
+const roomPeerId = (code) => ROOM_PEER_PREFIX + code;
+const normalizeCode = (raw) => String(raw || "").replace(/\D/g, "").slice(0, 4);
+
+function myRoomCode() {
+  let h = 0x811c9dc5; // FNV-1a
+  for (const ch of myUid) h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193);
+  return String(1000 + ((h >>> 0) % 9000));
+}
+
+// Only used if someone else is genuinely holding your code right now.
+const makeSpareCode = () => String(1000 + Math.floor(Math.random() * 9000));
 
 // STUN finds a direct path; the free TURN relays are the fallback when a
 // firewall/NAT blocks the direct one — without them a call can spend a long
@@ -442,7 +513,8 @@ function acceptConn(conn) {
 
 function acceptCall(call) {
   const e = entry(call.peer);
-  if (e.call) { try { call.close(); } catch {} return; }
+  // A returning peer (reconnect) brings a fresh call — swap out the dead one.
+  if (e.call) { const old = e.call; e.call = null; try { old.close(); } catch {} }
   call.answer(state.stream);
   registerCall(call);
 }
@@ -474,11 +546,17 @@ function registerConn(conn, outgoing) {
       }
     }
     announce(e);
+    if (isHostPeer(e) && redialStart) {
+      redialStart = 0;
+      addSystem("Reconnected ✓");
+    }
+    if (state.myAd) conn.send({ type: "ad", on: true, uid: myUid, name: profile.name });
     refreshStatus();
     enableChat(true);
   });
   conn.on("data", (msg) => handleData(e, msg));
-  conn.on("close", () => removePeer(e.id));
+  // A reconnect replaces e.conn; the old link closing late must not evict it.
+  conn.on("close", () => { if (e.conn === conn) removePeer(e.id); });
   conn.on("error", () => {});
 }
 
@@ -542,6 +620,11 @@ function handleData(e, msg) {
     case "bye":
       removePeer(e.id);
       break;
+    case "ad":
+      if (e.uid || msg.uid) {
+        onAdChange(String(e.uid || msg.uid), sanitizeProfile(msg).name, !!msg.on);
+      }
+      break;
   }
 }
 
@@ -556,7 +639,7 @@ function sanitizeProfile(src) {
 
 // The host is the peer whose id is the room code.
 function isHostPeer(e) {
-  return state.role === "guest" && e.id === state.room;
+  return state.role === "guest" && e.id === roomPeerId(state.room);
 }
 
 function setPeerProfile(e, src) {
@@ -597,6 +680,9 @@ function removePeer(pid) {
   try { e.call?.close(); } catch {}
   try { e.audioNode?.disconnect(); } catch {}
   e.tile?.remove();
+  if (e.uid && state.adHolds.has(e.uid)) onAdChange(e.uid, "", false);
+  // Lost the host (network blip, host reloading) — keep trying to get back.
+  if (state.role === "guest" && state.room && pid === roomPeerId(state.room)) scheduleHostRedial();
   // Hold the "left the party" note briefly; if they reconnect (a video change),
   // announce() cancels it so the reconnect stays silent.
   if (e.announced && e.uid) {
@@ -664,7 +750,7 @@ async function createRoom() {
   await ensureStream();
   state.role = "host";
   state.controllerUid = myUid; // the host starts holding the remote
-  startHost(makeCode(), 0, false);
+  startHost(myRoomCode(), 0, false);
 }
 
 // Re-create a room on the same code after the controller navigated to a new
@@ -679,27 +765,33 @@ async function rehostRoom(code) {
 
 function startHost(code, attempt, keepCode) {
   setStatus("wait", "Creating room…");
-  const p = newPeer(code);
+  const p = newPeer(roomPeerId(code));
   state.peer = p;
-  p.on("open", (id) => {
-    state.room = id;
+  p.on("open", () => {
+    state.room = code;
     if (!state.controllerUid) state.controllerUid = myUid;
     persistController();
     enterRoom();
     refreshStatus();
     if (!keepCode) feedEvent(profile, "created the party 🎉");
-    addSystem(`Share the code ${id} — up to ${MAX_PARTICIPANTS} people can join.`);
+    addSystem(`Share the code ${code} — up to ${MAX_PARTICIPANTS} people can join.`);
   });
   p.on("error", (err) => {
-    if (err?.type === "unavailable-id" && attempt < (keepCode ? 10 : 3)) {
+    if (err?.type === "unavailable-id" && attempt < (keepCode ? 10 : 6)) {
       try { p.destroy(); } catch {}
       state.peer = null;
-      if (keepCode) {
-        // The signaling server still holds our old id for a few seconds after
-        // the navigation dropped it — wait and reclaim the SAME code.
-        setTimeout(() => startHost(code, attempt + 1, true), 1200);
+      if (keepCode || code === myRoomCode()) {
+        // Usually it's our own previous session (a reload or navigation) that
+        // the signaling server hasn't dropped yet — wait and reclaim the SAME
+        // code. After a few tries someone else really has it: use a spare.
+        if (keepCode || attempt < 4) {
+          setTimeout(() => startHost(code, attempt + 1, keepCode), 1200);
+        } else {
+          addSystem(`Your code ${code} is busy right now, so this room uses a temporary one.`);
+          startHost(makeSpareCode(), attempt + 1, false);
+        }
       } else {
-        startHost(makeCode(), attempt + 1, false);
+        startHost(makeSpareCode(), attempt + 1, false);
       }
       return;
     }
@@ -709,8 +801,11 @@ function startHost(code, attempt, keepCode) {
 
 async function joinRoom(codeRaw, rejoinAttempt) {
   if (state.peer || !requireName()) return;
-  const code = String(codeRaw || "").trim().toLowerCase();
-  if (!code) return;
+  const code = normalizeCode(codeRaw);
+  if (code.length !== 4) {
+    setNote("Room codes are 4 digits.");
+    return;
+  }
   if (!rejoinAttempt) primeAudio(); // Join click is a gesture — unlock audio
   await ensureStream();
   state.role = "guest";
@@ -720,9 +815,12 @@ async function joinRoom(codeRaw, rejoinAttempt) {
   p.on("open", () => {
     state.room = code;
     enterRoom();
-    dialPeer(code);
+    dialPeer(roomPeerId(code));
   });
   p.on("error", (err) => {
+    // Mid-reconnect the host may not be back on the server yet; the redial
+    // loop keeps trying, so don't tear the peer down.
+    if (redialStart && (err?.type === "peer-unavailable" || err?.type === "network")) return;
     // On a rejoin the host may still be re-registering after its own
     // navigation — retry a few times before giving up.
     if (err?.type === "peer-unavailable" && (rejoinAttempt || 0) < 8) {
@@ -755,6 +853,7 @@ function leaveRoom() {
   broadcast({ type: "bye" });
   try { state.peer?.destroy(); } catch {}
   if (state.room) store.del("wp-ctrl-" + state.room);
+  state.leaving = true;
   if (FRAMED) parent.postMessage({ source: "watchparty", action: "clear-session" }, "*");
   setTimeout(() => location.reload(), 200);
 }
@@ -793,15 +892,12 @@ function controllerProfile() {
 }
 
 function queryPageVideo() {
-  if (FRAMED) parent.postMessage({ source: "watchparty", action: "video-query" }, "*");
+  if (HOSTED) hostPost({ action: "video-query" });
 }
 
 function applySyncLocal(kind, time) {
-  if (!FRAMED) return;
-  parent.postMessage(
-    { source: "watchparty", action: "video-control", cmd: kind, time: Number(time) || 0 },
-    "*"
-  );
+  if (!HOSTED) return;
+  hostPost({ action: "video-control", cmd: kind, time: typeof time === "number" ? time : undefined });
 }
 
 function feedSyncEvent(p, kind, time) {
@@ -846,6 +942,15 @@ function onPageVideoEvent(d) {
   if (d.kind === lastSyncKind && now - lastSyncSent < 250) return;
   lastSyncSent = now;
   lastSyncKind = d.kind;
+  if (holdActive() && d.kind === "play" && !state.myAd) {
+    // Someone's on an ad — stay paused so nobody gets ahead of them.
+    applySyncLocal("pause");
+    if (now - lastNoCtrlNote > 8000) {
+      lastNoCtrlNote = now;
+      addSystem("Hang on — waiting for an ad to finish so everyone stays together.");
+    }
+    return;
+  }
   if (iAmController()) {
     // I hold the remote — my action drives everyone.
     broadcast({ type: "sync", kind: d.kind, time: d.time, uid: myUid });
@@ -875,7 +980,7 @@ function onRemoteSync(e, msg) {
 // Position heartbeat from the controller — correct drift / land newcomers.
 function onControllerTick(e, msg) {
   if (String(msg.uid || e.uid) !== state.controllerUid) return;
-  if (iAmController()) return;
+  if (iAmController() || holdActive()) return;
   state.controllerState = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
   state.pendingTick = { time: Number(msg.time) || 0, paused: !!msg.paused, at: Date.now() };
   queryPageVideo();
@@ -950,6 +1055,114 @@ function toggleGrant(e) {
   setController(e.uid === state.controllerUid ? myUid : e.uid);
 }
 
+/* ------------------------------ reconnecting ------------------------------ */
+// A guest who loses the host keeps redialing the room code for a while, so a
+// network blip or the host reloading doesn't kick them out of the party.
+
+const REDIAL_EVERY = 2500;
+const REDIAL_FOR = 2 * 60 * 1000;
+let redialStart = 0;
+let redialTimer = null;
+
+function scheduleHostRedial() {
+  if (redialTimer || state.leaving || !state.room) return;
+  if (!redialStart) {
+    redialStart = Date.now();
+    setStatus("wait", "Reconnecting…");
+    addSystem("Lost the connection to the host — reconnecting…");
+  }
+  redialTimer = setTimeout(redialHost, REDIAL_EVERY);
+}
+
+function redialHost() {
+  redialTimer = null;
+  if (state.leaving || !state.room || !redialStart) return;
+  const hostId = roomPeerId(state.room);
+  const e = state.peers.get(hostId);
+  if (e?.conn?.open) { redialStart = 0; refreshStatus(); return; }
+  if (Date.now() - redialStart > REDIAL_FOR) {
+    redialStart = 0;
+    setStatus("err", "Disconnected");
+    addSystem("Couldn't reach the host. Ask them to start the room again, then press Leave and rejoin.");
+    return;
+  }
+  if (state.peer?.disconnected) { try { state.peer.reconnect(); } catch {} }
+  // Drop a half-open attempt so a fresh dial goes out (this re-arms the timer).
+  if (e) removePeer(hostId);
+  dialPeer(hostId);
+  scheduleHostRedial();
+}
+
+/* --------------------------------- ad hold --------------------------------- */
+// One member's player is showing an ad (others may be ad-free): everyone else
+// pauses at the same spot and waits. When the last ad ends, whoever holds the
+// remote resumes the room, so nobody drifts apart by the length of an ad.
+
+const AD_HOLD_MAX = 3 * 60 * 1000; // never wait on a single stuck "ad" forever
+
+function holdActive() {
+  for (const [uid, h] of state.adHolds) {
+    if (Date.now() - h.since > AD_HOLD_MAX) state.adHolds.delete(uid);
+  }
+  return state.adHolds.size > 0;
+}
+
+function setMyAd(on) {
+  if (on === state.myAd) return;
+  state.myAd = on;
+  if (!state.room) return;
+  broadcast({ type: "ad", on, uid: myUid, name: profile.name });
+  onAdChange(myUid, profile.name, on);
+}
+
+function onAdChange(uid, name, on) {
+  const wasHeld = holdActive();
+  if (on) {
+    if (state.adHolds.has(uid)) return;
+    state.adHolds.set(uid, { name: name || "Someone", since: Date.now() });
+    if (!wasHeld) startHold();
+    addSystem(uid === myUid
+      ? "You're watching an ad — everyone else is paused until it ends."
+      : `${name || "Someone"} is watching an ad — pausing until it ends.`);
+  } else {
+    if (!state.adHolds.delete(uid)) return;
+    if (wasHeld && !holdActive()) endHold();
+  }
+  renderHold();
+}
+
+function startHold() {
+  const cs = controllerCurrentState();
+  state.holdResume = cs ? !cs.paused : false;
+  // Pause in place — anyone not in an ad stops right where they are.
+  if (!state.myAd) applySyncLocal("pause");
+}
+
+function endHold() {
+  if (!iAmController() || !state.holdResume) return;
+  // Let the player leave the ad and settle, then restart everyone together.
+  setTimeout(() => {
+    if (holdActive() || !state.room || !iAmController()) return;
+    const lv = latestVideoState();
+    const t = lv ? lv.time : 0;
+    noteControllerState("play", t);
+    applySyncLocal("play", t);
+    broadcast({ type: "sync", kind: "play", time: t, uid: myUid });
+    addSystem("Ad finished — resuming for everyone.");
+  }, 900);
+}
+
+function renderHold() {
+  const el = $("holdBanner");
+  if (!holdActive()) { el.hidden = true; return; }
+  const names = [...state.adHolds.entries()]
+    .map(([uid, h]) => (uid === myUid ? "your" : `${h.name}'s`));
+  $("holdText").textContent = state.myAd
+    ? "You're on an ad — everyone else is paused until it ends."
+    : `Paused — waiting for ${names.join(" & ")} ad to finish…`;
+  el.hidden = false;
+}
+
 /* ------------------------------ content sync ------------------------------- */
 // The controller shares which video everyone watches; the rest auto-open it.
 
@@ -973,7 +1186,7 @@ function shareMyVideo() {
 
 // The controller changed the video — everyone else opens it.
 function onOpenVideo(fromUid, url) {
-  if (!FRAMED || !url) return;
+  if (!HOSTED || !url) return;
   if (fromUid !== state.controllerUid) return; // only follow the controller
   if (iAmController()) return;                  // don't follow myself
   if (state.navigating) return;
@@ -983,12 +1196,10 @@ function onOpenVideo(fromUid, url) {
   // clear the flag so a later video change still gets followed.
   setTimeout(() => { state.navigating = false; }, 6000);
   addSystem(`Opening ${controllerProfile().name}'s video…`);
-  // Store a one-shot rejoin (code + my role) and navigate; the sidebar
-  // auto-rejoins this same room once, on the new page.
-  parent.postMessage(
-    { source: "watchparty", action: "navigate", url, code: state.room, role: state.role },
-    "*"
-  );
+  // Navigate. In the side panel we simply stay connected; in the in-page
+  // frame a one-shot rejoin (code + my role) is stored so the sidebar
+  // auto-rejoins this same room on the new page.
+  hostPost({ action: "navigate", url, code: state.room, role: state.role });
 }
 
 /* -------------------------------- reactions -------------------------------- */
@@ -1024,7 +1235,7 @@ function popOut() {
     return;
   }
   if (state.room) leaveRoom(); // the popped-out window rejoins the same room
-  else if (FRAMED) parent.postMessage({ source: "watchparty", action: "close" }, "*");
+  else closeSidebar();
 }
 
 /* --------------------------------- settings -------------------------------- */
@@ -1279,7 +1490,7 @@ function profileChanged() {
 const identityApi = globalThis.chrome?.identity || globalThis.browser?.identity;
 
 // Talk to the profile-sync backend with the Google token, if one is configured.
-async function backendFetch(path, options = {}) {
+async function backendFetch(path, options = {}, retried = false) {
   if (!BACKEND_URL || !account?.token) return null;
   try {
     const res = await fetch(BACKEND_URL + path, {
@@ -1290,11 +1501,54 @@ async function backendFetch(path, options = {}) {
         ...(options.headers || {}),
       },
     });
-    if (!res.ok) return null;
+    // Google access tokens last an hour — get a fresh one silently and retry.
+    if (res.status === 401 && !retried && (await refreshTokenSilently())) {
+      return backendFetch(path, options, true);
+    }
+    if (!res.ok) {
+      console.warn("[watchparty] backend", path, res.status, await res.text().catch(() => ""));
+      return null;
+    }
     return await res.json();
-  } catch {
+  } catch (err) {
+    console.warn("[watchparty] backend unreachable:", BACKEND_URL, err);
     return null;
   }
+}
+
+// Re-issue the Google access token without any UI (works while the user is
+// still signed in to Google in this browser).
+function refreshTokenSilently() {
+  return new Promise((resolve) => {
+    if (!identityApi || !account) return resolve(false);
+    const done = (token) => {
+      if (!token) return resolve(false);
+      account.token = token;
+      store.set("wp-account", JSON.stringify(account));
+      resolve(true);
+    };
+    if (WEB_CLIENT_ID) {
+      const authUrl = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
+        client_id: WEB_CLIENT_ID,
+        response_type: "token",
+        redirect_uri: identityApi.getRedirectURL(),
+        scope: "openid email profile",
+        prompt: "none",
+        login_hint: account.email || "",
+      }).toString();
+      identityApi.launchWebAuthFlow({ url: authUrl, interactive: false }, (responseUrl) => {
+        void globalThis.chrome?.runtime?.lastError;
+        let token = "";
+        try { token = new URLSearchParams(new URL(responseUrl).hash.slice(1)).get("access_token") || ""; } catch {}
+        done(token);
+      });
+    } else {
+      identityApi.getAuthToken({ interactive: false }, (token) => {
+        void globalThis.chrome?.runtime?.lastError;
+        done(token || "");
+      });
+    }
+  });
 }
 
 // Apply a profile that came back from the backend onto the local one.
@@ -1334,6 +1588,7 @@ function renderAuthUI() {
   // Lobby gate: creating/joining a room requires signing in.
   $("lobbyAuth").hidden = signedIn;
   $("lobbyControls").hidden = !signedIn;
+  renderMyCode(); // the code follows the account
   updateLobbyButtons();
 }
 
@@ -1523,8 +1778,8 @@ function updateLobbyButtons() {
   // Must be signed in to create or join a room, and have a name.
   const ready = hasName && !!account;
   $("createBtn").disabled = !ready;
-  $("joinBtn").disabled = !ready;
-  if (state.view === "lobby" && FRAMED) {
+  $("joinBtn").disabled = !ready || joinDigits().length !== 4;
+  if (state.view === "lobby" && HOSTED) {
     const hasVideo = state.pageVideo;
     if (!hasVideo && ($("note").hidden || $("note").textContent === NO_VIDEO_HINT)) {
       $("note").className = "note hint-note";
@@ -1534,6 +1789,83 @@ function updateLobbyButtons() {
       setNote("");
     }
   }
+}
+
+async function copyCode(code, label) {
+  try {
+    await navigator.clipboard.writeText(code);
+    flash(label, "Copied");
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = code;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); flash(label, "Copied"); } catch {}
+    ta.remove();
+  }
+}
+
+// The lobby shows the user's own fixed code, one digit per tile.
+function renderMyCode() {
+  const code = myRoomCode();
+  $("myCode").replaceChildren(...[...code].map((d) => {
+    const s = document.createElement("span");
+    s.textContent = d;
+    return s;
+  }));
+  $("myCode").setAttribute("aria-label", "Your room code " + code.split("").join(" "));
+}
+
+/* Join: four one-digit boxes that behave like a single field. */
+const digitBoxes = () => [...document.querySelectorAll("#joinDigits input")];
+const joinDigits = () => digitBoxes().map((b) => b.value).join("");
+
+function setJoinDigits(raw) {
+  const code = normalizeCode(raw);
+  digitBoxes().forEach((b, i) => { b.value = code[i] || ""; });
+  updateLobbyButtons();
+}
+
+function wireJoinDigits() {
+  const boxes = digitBoxes();
+  boxes.forEach((box, i) => {
+    box.addEventListener("input", () => {
+      const v = normalizeCode(box.value);
+      if (v.length > 1) {
+        // Typed/autofilled several digits at once — spread them across.
+        setJoinDigits(joinDigits().slice(0, i) + v);
+        boxes[Math.min(i + v.length, 3)].focus();
+        return;
+      }
+      box.value = v;
+      if (v && i < 3) boxes[i + 1].focus();
+      updateLobbyButtons();
+      if (v && i === 3 && joinDigits().length === 4) $("joinBtn").focus();
+    });
+    box.addEventListener("keydown", (e) => {
+      if (e.key === "Backspace" && !box.value && i > 0) {
+        boxes[i - 1].value = "";
+        boxes[i - 1].focus();
+        updateLobbyButtons();
+        e.preventDefault();
+      } else if (e.key === "ArrowLeft" && i > 0) {
+        boxes[i - 1].focus();
+        e.preventDefault();
+      } else if (e.key === "ArrowRight" && i < 3) {
+        boxes[i + 1].focus();
+        e.preventDefault();
+      }
+    });
+    box.addEventListener("focus", () => box.select());
+    box.addEventListener("paste", (e) => {
+      const text = e.clipboardData?.getData("text") || "";
+      if (!normalizeCode(text)) return;
+      e.preventDefault();
+      setJoinDigits(text);
+      const n = joinDigits().length;
+      (n === 4 ? $("joinBtn") : boxes[n]).focus();
+    });
+  });
 }
 
 function flash(el, text) {
@@ -1555,8 +1887,10 @@ function wire() {
   $("createBtn").addEventListener("click", createRoom);
   $("joinForm").addEventListener("submit", (e) => {
     e.preventDefault();
-    joinRoom($("joinInput").value);
+    joinRoom(joinDigits());
   });
+  wireJoinDigits();
+  $("myCodeCopy").addEventListener("click", () => copyCode(myRoomCode(), $("myCodeCopyLabel")));
 
   $("chatForm").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -1568,20 +1902,7 @@ function wire() {
     input.value = "";
   });
 
-  $("copyBtn").addEventListener("click", async () => {
-    const code = state.room || "";
-    try {
-      await navigator.clipboard.writeText(code);
-      flash($("copyLabel"), "Copied");
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = code;
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); flash($("copyLabel"), "Copied"); } catch {}
-      ta.remove();
-    }
-  });
+  $("copyBtn").addEventListener("click", () => copyCode(state.room || "", $("copyLabel")));
 
   $("camBtn").addEventListener("click", toggleCam);
   $("micBtn").addEventListener("click", toggleMic);
@@ -1625,41 +1946,20 @@ function wire() {
   $("settingsSave").addEventListener("click", saveSettings);
   $("settingsClose").addEventListener("click", () => { $("settingsPanel").hidden = true; });
 
-  $("closeBtn").addEventListener("click", () => {
-    parent.postMessage({ source: "watchparty", action: "close" }, "*");
-  });
-  if (!FRAMED) {
+  $("closeBtn").addEventListener("click", closeSidebar);
+  if (!HOSTED) {
     $("closeBtn").style.display = "none";
   }
 
   buildProfileControls();
 
   window.addEventListener("message", (e) => {
+    if (!FRAMED || e.source !== parent) return;
     const d = e.data;
     if (!d || d.source !== "watchparty-host") return;
-    if (d.action === "visibility") {
-      if (!d.open && !state.room && !FAKE) stopPreview();
-      else if (d.open && !state.stream) ensureStream();
-    } else if (d.action === "video-event") {
-      onPageVideoEvent(d);
-    } else if (d.action === "video-state") {
-      state.pageVideo = !!d.available;
-      if (typeof d.href === "string") state.pageHref = d.href;
-      if (state.pageVideo) {
-        state.lastVideo = { paused: !!d.paused, time: Number(d.time) || 0, at: Date.now() };
-      }
-      updateLobbyButtons();
-      shareMyVideo(); // if I hold the remote, broadcast this watch URL
-      // A follower compares the controller's reported position against its own.
-      if (state.pendingTick && Date.now() - state.pendingTick.at < 3000 && state.pageVideo) {
-        const t = state.pendingTick;
-        state.pendingTick = null;
-        const target = t.time + (t.paused ? 0 : (Date.now() - t.at) / 1000);
-        if (Math.abs((Number(d.time) || 0) - target) > 2) applySyncLocal("seek", target);
-        if (!!d.paused !== t.paused) applySyncLocal(t.paused ? "pause" : "play", target);
-      }
-    }
+    onHostMessage(d);
   });
+  if (PANEL) wirePanel();
 
   window.addEventListener("beforeunload", () => {
     broadcast({ type: "bye" });
@@ -1670,6 +1970,78 @@ function wire() {
   ["click", "keydown", "pointerdown", "touchstart"].forEach((ev) =>
     document.addEventListener(ev, resumeAudio, true)
   );
+}
+
+// Reports from the page under us (video state/events, panel visibility).
+function onHostMessage(d) {
+  if (d.action === "page-ready") {
+    queryPageVideo();
+  } else if (d.action === "visibility") {
+    if (!d.open && !state.room && !FAKE) stopPreview();
+    else if (d.open && !state.stream) ensureStream();
+  } else if (d.action === "video-event") {
+    onPageVideoEvent(d);
+  } else if (d.action === "video-state") {
+    const hadVideo = state.pageVideo;
+    state.pageVideo = !!d.available;
+    if (typeof d.href === "string") state.pageHref = d.href;
+    setMyAd(state.pageVideo && !!d.ad);
+    // An ad's clock isn't the show's — keep the last real position.
+    if (state.pageVideo && !d.ad) {
+      state.lastVideo = { paused: !!d.paused, time: Number(d.time) || 0, at: Date.now() };
+    }
+    updateLobbyButtons();
+    // A follower whose video just appeared (fresh page / video change) lands
+    // at the controller's position right away instead of waiting for a tick.
+    if (state.room && state.pageVideo && !hadVideo && !iAmController() && !d.ad) {
+      const cs = controllerCurrentState();
+      if (cs) state.pendingTick = { time: cs.time, paused: cs.paused || holdActive(), at: Date.now() };
+    }
+    shareMyVideo(); // if I hold the remote, broadcast this watch URL
+    // A follower compares the controller's reported position against its own.
+    if (state.pendingTick && Date.now() - state.pendingTick.at < 3000 && state.pageVideo) {
+      const t = state.pendingTick;
+      state.pendingTick = null;
+      const target = t.time + (t.paused ? 0 : (Date.now() - t.at) / 1000);
+      if (Math.abs((Number(d.time) || 0) - target) > 2) applySyncLocal("seek", target);
+      if (!!d.paused !== t.paused) applySyncLocal(t.paused ? "pause" : "play", target);
+    }
+  }
+}
+
+function closeSidebar() {
+  if (PANEL) window.close();
+  else if (FRAMED) parent.postMessage({ source: "watchparty", action: "close" }, "*");
+}
+
+// Side panel: follow the active tab of our window, and hear its content script.
+function wirePanel() {
+  let myWindowId = null;
+  const bind = async () => {
+    try {
+      const [tab] = await ext.tabs.query({ active: true, currentWindow: true });
+      if (!tab) return;
+      myWindowId = tab.windowId;
+      if (tab.id !== hostTabId) {
+        hostTabId = tab.id;
+        state.pageVideo = false;
+        updateLobbyButtons();
+      }
+      queryPageVideo();
+    } catch {}
+  };
+  ext.tabs.onActivated.addListener((info) => {
+    if (myWindowId == null || info.windowId === myWindowId) bind();
+  });
+  ext.tabs.onUpdated.addListener((tabId, info) => {
+    if (tabId === hostTabId && info.status === "complete") queryPageVideo();
+  });
+  ext.runtime.onMessage.addListener((msg, sender) => {
+    if (!msg || msg.source !== "watchparty-host") return;
+    if (sender.tab?.id !== hostTabId) return;
+    onHostMessage(msg);
+  });
+  bind();
 }
 
 async function init() {
@@ -1684,8 +2056,10 @@ async function init() {
   setStatus("", "Off air");
   // If signed in, pull the latest profile from the account so edits made on
   // another device show up here.
+  // POST /auth upserts, so someone who signed in before the backend was set
+  // up still gets their account record created.
   if (account && BACKEND_URL) {
-    backendFetch("/profile").then((p) => { if (p) { applyServerProfile(p); renderAuthUI(); } });
+    backendFetch("/auth", { method: "POST" }).then((p) => { if (p) { applyServerProfile(p); renderAuthUI(); } });
   }
   // This is the moment the browser asks for camera/mic permission — right when
   // the sidebar opens on Netflix/YouTube/Prime/anywhere.
@@ -1694,12 +2068,14 @@ async function init() {
 
   // Keep watching the page's video: gates the lobby until one is selected,
   // and keeps the controller's position fresh for join-state and drift ticks.
-  if (FRAMED) setInterval(queryPageVideo, 4000);
+  if (HOSTED) setInterval(queryPageVideo, 4000);
   setInterval(() => {
-    if (iAmController() && state.room && FRAMED) {
+    if (iAmController() && state.room && HOSTED && !state.myAd && !holdActive()) {
       const lv = latestVideoState();
       if (lv) broadcast({ type: "sync-tick", time: lv.time, paused: lv.paused, uid: myUid });
     }
+    // Re-announce an ongoing ad so anyone who joined mid-ad also waits.
+    if (state.myAd && state.room) broadcast({ type: "ad", on: true, uid: myUid, name: profile.name });
     // Keep the driving rejoin fresh so it never expires between navigations.
     persistRejoinIfDriving();
   }, 8000);
@@ -1714,7 +2090,7 @@ async function init() {
   } else if (params.get("create") === "1" && profile.name) {
     createRoom();
   } else if (join) {
-    $("joinInput").value = join;
+    setJoinDigits(join);
     if (profile.name) joinRoom(join);
     else setNote("Enter your name, then press Join.");
   }
